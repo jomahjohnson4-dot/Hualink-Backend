@@ -1,9 +1,9 @@
-const morgan = require('morgan');
-const logger = require('../utils/logger');
+import morgan from 'morgan';
+import logger from '../utils/logger.js';
 
 // Define stream object for Morgan
 const stream = {
-  write: (message) => logger.info(message.trim())
+  write: (message) => logger.info(message.trim()),
 };
 
 // Skip logging during automated test runs
@@ -17,4 +17,4 @@ const httpLogger = morgan(
   { stream, skip }
 );
 
-module.exports = httpLogger;
+export default httpLogger;

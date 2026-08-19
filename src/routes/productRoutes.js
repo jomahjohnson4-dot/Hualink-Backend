@@ -1,17 +1,26 @@
-const express = require('express');
-const router = express.Router();
-const { 
-  getProducts, 
-  createProduct, 
-  updateProduct 
-} = require('../controllers/productController');
-const { authenticateJWT } = require('../middleware/authHandler');
+import { Router } from 'express';
+import {
+  getProducts,
+  getProductById,
+  createProduct,
+  updateProduct,
+  deleteProduct,
+  getAnalytics,
+} from '../controllers/productController.js';
+import { authenticateJWT, restrictTo } from '../middleware/authHandler.js';
 
-// Public read access
+const router = Router();
+
+// Public Read Access
 router.get('/', getProducts);
+router.get('/:id', getProductById);
 
-// Protected admin write actions
-router.post('/', authenticateJWT, createProduct);
-router.put('/:id', authenticateJWT, updateProduct);
+// Protected Admin / Depot Analytics & Inventory Alert Route
+router.get('/analytics/overview', authenticateJWT, restrictTo('admin', 'depot'), getAnalytics);
 
-module.exports = router;
+// Protected Admin / Depot Write Actions
+router.post('/', authenticateJWT, restrictTo('admin', 'depot'), createProduct);
+router.put('/:id', authenticateJWT, restrictTo('admin', 'depot'), updateProduct);
+router.delete('/:id', authenticateJWT, restrictTo('admin', 'depot'), deleteProduct);
+
+export default router;

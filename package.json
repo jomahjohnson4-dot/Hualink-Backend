@@ -1,21 +1,37 @@
 {
   "name": "hualink-distribution",
   "version": "1.0.0",
-  "description": "",
+  "description": "Backend API and database services for Hualink Distribution Platform",
+  "type": "module",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "nodemon server.js"
+    "dev": "nodemon server.js",
+    "seed": "node prisma/seed.js",
+    "test:webhook": "node test-webhook.js",
+    "test:webhook:invalid": "node test-invalid-signature.js",
+    "db:migrate": "prisma migrate dev",
+    "db:deploy": "prisma migrate deploy",
+    "db:generate": "prisma generate",
+    "db:studio": "prisma studio"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": [
+    "hualink",
+    "express",
+    "prisma",
+    "postgresql",
+    "ecommerce",
+    "webhooks"
+  ],
+  "author": "Johnson Nyarusanda",
   "license": "ISC",
   "prisma": {
     "seed": "node prisma/seed.js"
   },
   "dependencies": {
     "@prisma/adapter-pg": "^7.9.1",
-    "@prisma/client": "^6.4.0",
+    "@prisma/client": "^7.9.1",
+    "axios": "^1.19.0",
     "bcryptjs": "^3.0.3",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
@@ -30,6 +46,14 @@
   },
   "devDependencies": {
     "nodemon": "^3.1.14",
-    "prisma":"^6.4.0"
-  }
+    "prisma": "^7.9.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jomahjohnson4-dot/Hualink-Backend.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jomahjohnson4-dot/Hualink-Backend/issues"
+  },
+  "homepage": "https://github.com/jomahjohnson4-dot/Hualink-Backend#readme"
 }

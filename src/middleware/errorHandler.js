@@ -1,20 +1,20 @@
+import logger from '../utils/logger.js';
+
 const errorHandler = (err, req, res, next) => {
-  console.error(`[ERROR] ${err.message}`);
-
-  // Handle Prisma Record Not Found Error
-  if (err.code === 'P2025') {
-    return res.status(404).json({ error: 'Requested record was not found.' });
+  // Log the detailed error stack using your logger
+  if (logger && logger.error) {
+    logger.error(err.stack || err.message);
+  } else {
+    console.error(err.stack || err.message);
   }
 
-  // Handle Prisma Unique Constraint Error
-  if (err.code === 'P2002') {
-    return res.status(400).json({ error: 'Unique constraint failed. Duplicate value provided.' });
-  }
+  const statusCode = err.statusCode || res.statusCode !== 200 ? res.statusCode : 500;
 
-  // Fallback Error Response
-  res.status(err.status || 500).json({
-    error: err.message || 'Internal Server Error'
+  res.status(statusCode).json({
+    success: false,
+    message: err.message || 'Internal Server Error',
+    ...(process.env.NODE_ENV === 'development' && { stack: err.stack }),
   });
 };
 
-module.exports = errorHandler;
+export default errorHandler;

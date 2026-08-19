@@ -1,11 +1,11 @@
-const prisma = require('../prismaClient');
+import prisma from '../prismaClient.js';
 
 // Get all products with search, category filtering, and pagination
-exports.getProducts = async (req, res, next) => {
+export const getProducts = async (req, res, next) => {
   const { category, search, page = 1, limit = 10 } = req.query;
 
-  const pageNum = parseInt(page, 10);
-  const limitNum = parseInt(limit, 10);
+  const pageNum = parseInt(page, 10) || 1;
+  const limitNum = parseInt(limit, 10) || 10;
   const skip = (pageNum - 1) * limitNum;
 
   try {
@@ -14,9 +14,10 @@ exports.getProducts = async (req, res, next) => {
       ...(search && {
         OR: [
           { name: { contains: search, mode: 'insensitive' } },
-          { category: { contains: search, mode: 'insensitive' } }
-        ]
-      })
+          { category: { contains: search, mode: 'insensitive' } },
+          { description: { contains: search, mode: 'insensitive' } },
+        ],
+      }),
     };
 
     const [products, totalCount] = await Promise.all([
@@ -25,172 +26,167 @@ exports.getProducts = async (req, res, next) => {
         include: { variants: true },
         skip,
         take: limitNum,
-        orderBy: { createdAt: 'desc' }
+        orderBy: { createdAt: 'desc' },
       }),
-      prisma.product.count({ where: whereClause })
+      prisma.product.count({ where: whereClause }),
     ]);
 
     res.status(200).json({
+      success: true,
       data: products,
       pagination: {
         totalItems: totalCount,
         totalPages: Math.ceil(totalCount / limitNum),
         currentPage: pageNum,
-        pageSize: limitNum
-      }
+        pageSize: limitNum,
+      },
     });
   } catch (error) {
     next(error);
   }
 };
 
-// Create a new product with variants
-exports.createProduct = async (req, res) => {
-  const { name, category, basePrice, stockCount, variants } = req.body;
+// Get single product by ID with variants
+export const getProductById = async (req, res, next) => {
   try {
+    const product = await prisma.product.findUnique({
+      where: { id: req.params.id },
+      include: { variants: true },
+    });
+
+    if (!product) {
+      return res.status(404).json({ success: false, message: 'Product not found' });
+    }
+
+    res.status(200).json({ success: true, data: product });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// Create a new product (handles both variants and basic fields)
+export const createProduct = async (req, res, next) => {
+  const { name, category, description, image, basePrice, price, stockCount, stock, variants } = req.body;
+
+  try {
+    const finalPrice = parseFloat(basePrice ?? price ?? 0);
+    const finalStock = parseInt(stockCount ?? stock ?? 0, 10);
+
     const product = await prisma.product.create({
       data: {
         name,
         category,
-        basePrice: parseFloat(basePrice),
-        stockCount: parseInt(stockCount) || 0,
-        variants: {
-          create: variants || []
-        }
+        description,
+        image,
+        basePrice: finalPrice,
+        price: finalPrice,
+        stockCount: finalStock,
+        stock: finalStock,
+        ...(variants && Array.isArray(variants) && variants.length > 0 && {
+          variants: {
+            create: variants,
+          },
+        }),
       },
-      include: { variants: true }
+      include: { variants: true },
     });
-    res.status(201).json(product);
+
+    res.status(201).json({ success: true, data: product });
   } catch (error) {
-    res.status(400).json({ error: error.message });
+    next(error);
   }
 };
 
 // Update product stock or details
-exports.updateProduct = async (req, res, next) => {
+export const updateProduct = async (req, res, next) => {
   const { id } = req.params;
-  const { stockCount, basePrice, name, category } = req.body;
+  const { name, category, description, image, stockCount, stock, basePrice, price } = req.body;
 
   try {
+    const parsedPrice = basePrice !== undefined ? parseFloat(basePrice) : price !== undefined ? parseFloat(price) : undefined;
+    const parsedStock = stockCount !== undefined ? parseInt(stockCount, 10) : stock !== undefined ? parseInt(stock, 10) : undefined;
+
     const updatedProduct = await prisma.product.update({
       where: { id },
       data: {
-        ...(stockCount !== undefined && { stockCount: parseInt(stockCount) }),
-        ...(basePrice !== undefined && { basePrice: parseFloat(basePrice) }),
         ...(name && { name }),
-        ...(category && { category })
+        ...(category && { category }),
+        ...(description && { description }),
+        ...(image && { image }),
+        ...(parsedPrice !== undefined && { basePrice: parsedPrice, price: parsedPrice }),
+        ...(parsedStock !== undefined && { stockCount: parsedStock, stock: parsedStock }),
       },
-      include: { variants: true }
+      include: { variants: true },
     });
 
-    res.status(200).json(updatedProduct);
-  } catch (error) {
-    next(error); // Pass to centralized error handler
-  }
-};// Get Business Analytics & Inventory Warnings
-exports.getAnalytics = async (req, res, next) => {
-  try {
-    const completedRevenueResult = await prisma.order.aggregate({
-      where: { paymentStatus: 'COMPLETED' },
-      _sum: { totalAmount: true },
-      _count: { id: true }
-    });
-
-    const pendingRevenueResult = await prisma.order.aggregate({
-      where: { paymentStatus: 'PENDING' },
-      _sum: { totalAmount: true },
-      _count: { id: true }
-    });
-
-    const LOW_STOCK_THRESHOLD = 10;
-    const lowStockProducts = await prisma.product.findMany({
-      where: {
-        stockCount: {
-          lt: LOW_STOCK_THRESHOLD
-        }
-      },
-      select: {
-        id: true,
-        name: true,
-        category: true,
-        stockCount: true,
-        basePrice: true
-      },
-      orderBy: { stockCount: 'asc' }
-    });
-
-    const totalProductsCount = await prisma.product.count();
-
-    res.status(200).json({
-      summary: {
-        totalCompletedRevenue: completedRevenueResult._sum.totalAmount || 0,
-        completedOrdersCount: completedRevenueResult._count.id,
-        totalPendingRevenue: pendingRevenueResult._sum.totalAmount || 0,
-        pendingOrdersCount: pendingRevenueResult._count.id,
-        totalCatalogProducts: totalProductsCount
-      },
-      inventoryAlerts: {
-        threshold: LOW_STOCK_THRESHOLD,
-        lowStockCount: lowStockProducts.length,
-        items: lowStockProducts
-      }
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-// Get all products
-exports.getProducts = async (req, res, next) => {
-  try {
-    const products = await prisma.product.findMany();
-    res.json(products);
-  } catch (error) {
-    next(error);
-  }
-};
-
-// Get single product by ID
-exports.getProductById = async (req, res, next) => {
-  try {
-    const product = await prisma.product.findUnique({
-      where: { id: req.params.id }
-    });
-    if (!product) return res.status(404).json({ error: 'Product not found' });
-    res.json(product);
-  } catch (error) {
-    next(error);
-  }
-};
-
-// Create product
-exports.createProduct = async (req, res, next) => {
-  try {
-    const product = await prisma.product.create({ data: req.body });
-    res.status(201).json(product);
-  } catch (error) {
-    next(error);
-  }
-};
-
-// Update product
-exports.updateProduct = async (req, res, next) => {
-  try {
-    const product = await prisma.product.update({
-      where: { id: req.params.id },
-      data: req.body
-    });
-    res.json(product);
+    res.status(200).json({ success: true, data: updatedProduct });
   } catch (error) {
     next(error);
   }
 };
 
 // Delete product
-exports.deleteProduct = async (req, res, next) => {
+export const deleteProduct = async (req, res, next) => {
   try {
     await prisma.product.delete({ where: { id: req.params.id } });
-    res.json({ message: 'Product deleted successfully' });
+    res.status(200).json({ success: true, message: 'Product deleted successfully' });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// Get Business Analytics & Inventory Warnings
+export const getAnalytics = async (req, res, next) => {
+  try {
+    const completedRevenueResult = await prisma.order.aggregate({
+      where: { paymentStatus: 'COMPLETED' },
+      _sum: { totalAmount: true },
+      _count: { id: true },
+    });
+
+    const pendingRevenueResult = await prisma.order.aggregate({
+      where: { paymentStatus: 'PENDING' },
+      _sum: { totalAmount: true },
+      _count: { id: true },
+    });
+
+    const LOW_STOCK_THRESHOLD = 10;
+    const lowStockProducts = await prisma.product.findMany({
+      where: {
+        OR: [
+          { stockCount: { lt: LOW_STOCK_THRESHOLD } },
+          { stock: { lt: LOW_STOCK_THRESHOLD } },
+        ],
+      },
+      select: {
+        id: true,
+        name: true,
+        category: true,
+        stockCount: true,
+        stock: true,
+        basePrice: true,
+        price: true,
+      },
+      orderBy: { stockCount: 'asc' },
+    });
+
+    const totalProductsCount = await prisma.product.count();
+
+    res.status(200).json({
+      success: true,
+      summary: {
+        totalCompletedRevenue: completedRevenueResult._sum.totalAmount || 0,
+        completedOrdersCount: completedRevenueResult._count.id,
+        totalPendingRevenue: pendingRevenueResult._sum.totalAmount || 0,
+        pendingOrdersCount: pendingRevenueResult._count.id,
+        totalCatalogProducts: totalProductsCount,
+      },
+      inventoryAlerts: {
+        threshold: LOW_STOCK_THRESHOLD,
+        lowStockCount: lowStockProducts.length,
+        items: lowStockProducts,
+      },
+    });
   } catch (error) {
     next(error);
   }

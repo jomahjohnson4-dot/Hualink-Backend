@@ -1,9 +1,18 @@
-const express = require('express');
-const router = express.Router();
-const { register, login } = require('../controllers/authController');
-const { loginLimiter } = require('../middleware/rateLimiter');
+import { Router } from 'express';
+import {
+  registerAdmin,
+  loginAdmin,
+  getProfile,
+} from '../controllers/authController.js';
+import { authenticateJWT } from '../middleware/authHandler.js';
 
-router.post('/register', register);
-router.post('/login', loginLimiter, login);
+const router = Router();
 
-module.exports = router;
+// Admin registration & login
+router.post('/register', registerAdmin);
+router.post('/login', loginAdmin);
+
+// Protected user profile route
+router.get('/me', authenticateJWT, getProfile);
+
+export default router;

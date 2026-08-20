@@ -1,47 +1,52 @@
-import { prisma } from '../prismaClient.js';
+import { prisma } from '../utils/prismaClient.js';
+import {
+  getDashboardAnalyticsService,
+  forecastRevenueService,
+} from '../services/analyticsService.js';
 
-// Get Business Analytics & Inventory Warnings
-export const getAnalytics = async (req, res) => {
+/**
+ * Detailed Analytics & Inventory Warning Summary
+ */
+export const getAnalytics = async (req, res, next) => {
   try {
-    // 1. Calculate Total Revenue (COMPLETED orders only)
-    const completedRevenueResult = await prisma.order.aggregate({
-      where: { paymentStatus: 'COMPLETED' },
-      _sum: { totalAmount: true },
-      _count: { id: true },
-    });
-
-    // 2. Calculate Pending Revenue (PENDING orders)
-    const pendingRevenueResult = await prisma.order.aggregate({
-      where: { paymentStatus: 'PENDING' },
-      _sum: { totalAmount: true },
-      _count: { id: true },
-    });
-
-    // 3. Find Products with Low Stock (Stock Count < 10)
     const LOW_STOCK_THRESHOLD = 10;
-    const lowStockProducts = await prisma.product.findMany({
-      where: {
-        stockCount: {
-          lt: LOW_STOCK_THRESHOLD,
-        },
-      },
-      select: {
-        id: true,
-        name: true,
-        category: true,
-        stockCount: true,
-        basePrice: true,
-      },
-      orderBy: { stockCount: 'asc' },
-    });
 
-    // 4. Calculate Total Unique Products in Inventory
-    const totalProductsCount = await prisma.product.count();
+    const [paidRevenueResult, pendingRevenueResult, lowStockProducts, totalProductsCount] =
+      await Promise.all([
+        // 1. Paid Revenue (Matches updated PaymentStatus enum: PAID)
+        prisma.order.aggregate({
+          where: { paymentStatus: 'PAID' },
+          _sum: { totalAmount: true },
+          _count: { id: true },
+        }),
+        // 2. Pending Revenue
+        prisma.order.aggregate({
+          where: { paymentStatus: 'PENDING' },
+          _sum: { totalAmount: true },
+          _count: { id: true },
+        }),
+        // 3. Low Stock Items
+        prisma.product.findMany({
+          where: { stockCount: { lt: LOW_STOCK_THRESHOLD } },
+          select: {
+            id: true,
+            name: true,
+            category: true,
+            stockCount: true,
+            basePrice: true,
+            warehouseLocation: true,
+          },
+          orderBy: { stockCount: 'asc' },
+        }),
+        // 4. Total Catalog Products Count
+        prisma.product.count(),
+      ]);
 
-    res.status(200).json({
+    return res.status(200).json({
+      success: true,
       summary: {
-        totalCompletedRevenue: completedRevenueResult._sum.totalAmount || 0,
-        completedOrdersCount: completedRevenueResult._count.id,
+        totalPaidRevenue: paidRevenueResult._sum.totalAmount || 0,
+        paidOrdersCount: paidRevenueResult._count.id,
         totalPendingRevenue: pendingRevenueResult._sum.totalAmount || 0,
         pendingOrdersCount: pendingRevenueResult._count.id,
         totalCatalogProducts: totalProductsCount,
@@ -53,17 +58,19 @@ export const getAnalytics = async (req, res) => {
       },
     });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    next(error);
   }
 };
 
-// Get total revenue and completed order count
+/**
+ * Filtered Sales Overview (Supports Date Range)
+ */
 export const getSalesOverview = async (req, res, next) => {
   try {
     const { startDate, endDate } = req.query;
 
     const whereClause = {
-      paymentStatus: 'COMPLETED',
+      paymentStatus: 'PAID',
       ...((startDate || endDate) && {
         createdAt: {
           ...(startDate && { gte: new Date(startDate) }),
@@ -81,36 +88,33 @@ export const getSalesOverview = async (req, res, next) => {
       prisma.order.count({ where: whereClause }),
     ]);
 
-    res.json({
-      totalRevenue: salesAggregate._sum.totalAmount || 0,
-      averageOrderValue: salesAggregate._avg.totalAmount || 0,
-      totalCompletedOrders: totalOrders,
+    return res.status(200).json({
+      success: true,
+      data: {
+        totalRevenue: salesAggregate._sum.totalAmount || 0,
+        averageOrderValue: salesAggregate._avg.totalAmount || 0,
+        totalCompletedOrders: totalOrders,
+      },
     });
   } catch (error) {
     next(error);
   }
 };
 
-// Get top-selling products by quantity ordered
+/**
+ * Top-Selling Products by Volume
+ */
 export const getTopSellingProducts = async (req, res, next) => {
   try {
     const limit = parseInt(req.query.limit, 10) || 5;
 
-    // Group order items by productId and sum quantities
     const groupedItems = await prisma.orderItem.groupBy({
       by: ['productId'],
-      _sum: {
-        quantity: true,
-      },
-      orderBy: {
-        _sum: {
-          quantity: 'desc',
-        },
-      },
+      _sum: { quantity: true },
+      orderBy: { _sum: { quantity: 'desc' } },
       take: limit,
     });
 
-    // Populate product details for top items
     const productIds = groupedItems.map((item) => item.productId);
     const products = await prisma.product.findMany({
       where: { id: { in: productIds } },
@@ -119,30 +123,34 @@ export const getTopSellingProducts = async (req, res, next) => {
     const topProducts = groupedItems.map((item) => {
       const product = products.find((p) => p.id === item.productId);
       return {
-        product,
-        totalQuantitySold: item._sum.quantity,
+        product: product || null,
+        totalQuantitySold: item._sum.quantity || 0,
       };
     });
 
-    res.json(topProducts);
+    return res.status(200).json({
+      success: true,
+      data: topProducts,
+    });
   } catch (error) {
     next(error);
   }
 };
 
-// Get low-stock inventory alerts
+/**
+ * Low-Stock Inventory Alerts
+ */
 export const getLowStockAlerts = async (req, res, next) => {
   try {
     const threshold = parseInt(req.query.threshold, 10) || 10;
 
     const lowStockProducts = await prisma.product.findMany({
-      where: {
-        stockCount: { lte: threshold },
-      },
+      where: { stockCount: { lte: threshold } },
       orderBy: { stockCount: 'asc' },
     });
 
-    res.json({
+    return res.status(200).json({
+      success: true,
       threshold,
       count: lowStockProducts.length,
       products: lowStockProducts,
@@ -152,22 +160,59 @@ export const getLowStockAlerts = async (req, res, next) => {
   }
 };
 
-// Combined Dashboard Overview
+/**
+ * Combined Executive Dashboard Overview
+ */
 export const getDashboardSummary = async (req, res, next) => {
   try {
     const [sales, lowStock, totalProducts] = await Promise.all([
       prisma.order.aggregate({
         _sum: { totalAmount: true },
-        where: { paymentStatus: 'COMPLETED' },
+        where: { paymentStatus: 'PAID' },
       }),
       prisma.product.count({ where: { stockCount: { lte: 10 } } }),
       prisma.product.count(),
     ]);
 
-    res.json({
-      totalRevenue: sales._sum.totalAmount || 0,
-      totalProducts,
-      lowStockAlertsCount: lowStock,
+    return res.status(200).json({
+      success: true,
+      data: {
+        totalRevenue: sales._sum.totalAmount || 0,
+        totalProducts,
+        lowStockAlertsCount: lowStock,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Aggregated Dashboard Analytics Service Delegate
+ */
+export const getDashboardAnalytics = async (req, res, next) => {
+  try {
+    const analytics = await getDashboardAnalyticsService();
+    return res.status(200).json({
+      success: true,
+      data: analytics,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Predictive Sales & Revenue Forecasting
+ */
+export const getRevenueForecast = async (req, res, next) => {
+  try {
+    const days = parseInt(req.query.days || '7', 10);
+    const forecast = await forecastRevenueService(days);
+
+    return res.status(200).json({
+      success: true,
+      data: forecast,
     });
   } catch (error) {
     next(error);

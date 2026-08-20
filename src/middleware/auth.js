@@ -1,5 +1,5 @@
 import jwt from 'jsonwebtoken';
-import prisma from '../prismaClient.js';
+import prisma from '../utils/prismaClient.js';
 import logger from '../utils/logger.js';
 
 /**

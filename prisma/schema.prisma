@@ -4,11 +4,71 @@ generator client {
 
 datasource db {
   provider = "postgresql"
-  
 }
 
 // ==========================================
-// SERVICES MODEL (Added for Services Hub)
+// ENUMS
+// ==========================================
+enum Role {
+  CUSTOMER
+  BUSINESS
+  SUPPLIER
+  ADMIN
+}
+
+enum OrderStatus {
+  PENDING
+  CONFIRMED
+  PROCESSING
+  SHIPPED
+  OUT_FOR_DELIVERY
+  DELIVERED
+  CANCELLED
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+}
+
+// ==========================================
+// USER & AUTHENTICATION MODELS
+// ==========================================
+model User {
+  id          String   @id @default(uuid())
+  email       String   @unique
+  password    String
+  name        String
+  phone       String?
+  role        Role     @default(CUSTOMER)
+
+  // B2B Business & Supplier Fields
+  companyName String?
+  tinNumber   String?
+
+  orders      Order[]
+  addresses   Address[]
+  products    Product[] // Products supplied/managed by business or supplier
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+}
+
+model Address {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  region    String   // e.g., 'Dar es Salaam', 'Mbeya'
+  district  String?
+  street    String
+  details   String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ==========================================
+// SERVICES MODEL
 // ==========================================
 model Service {
   id          String   @id @default(uuid())
@@ -28,54 +88,85 @@ model Service {
 }
 
 // ==========================================
-// EXISTING E-COMMERCE MODELS
+// E-COMMERCE PRODUCTS & VARIANTS
 // ==========================================
 model Product {
-  id          String      @id @default(uuid())
-  name        String
-  category    String
-  basePrice   Float
-  stockCount  Int         @default(0)
-  variants    Variant[]
-  orderItems  OrderItem[]
-  createdAt   DateTime    @default(now())
+  id               String      @id @default(uuid())
+  name             String
+  sku              String?     @unique
+  category         String
+  description      String?
+  image            String?
+  basePrice        Float
+  wholesalePrice   Float?      // Tiered wholesale pricing for B2B users
+  minWholesaleQty  Int?        @default(10)
+  stockCount       Int         @default(0)
+  warehouseLocation String?    @default("Main Warehouse")
+
+  supplierId       String?
+  supplier         User?       @relation(fields: [supplierId], references: [id], onDelete: SetNull)
+
+  variants         Variant[]
+  orderItems       OrderItem[]
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
 }
 
 model Variant {
-  id        String  @id @default(uuid())
-  sku       String  @unique
+  id        String   @id @default(uuid())
+  sku       String   @unique
   color     String?
   storage   String?
   price     Float
   productId String
-  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
 
+// ==========================================
+// ORDERS & CHECKOUT
+// ==========================================
 model Order {
-  id             String      @id @default(uuid())
-  orderNumber    String      @unique
-  customerPhone  String
-  totalAmount    Float
-  paymentStatus  String      @default("PENDING")
-  paymentMethod  String
-  transactionRef String?
-  items          OrderItem[]
-  createdAt      DateTime    @default(now())
+  id              String        @id @default(uuid())
+  orderNumber     String        @unique
+  customerPhone   String
+  shippingAddress String        @default("Default Address")
+  region          String        @default("Dar es Salaam")
+  totalAmount     Float
+  status          OrderStatus   @default(PENDING)
+  paymentStatus   PaymentStatus @default(PENDING)
+  paymentMethod   String        @default("MANUAL_MOBILE") // e.g., 'SELCOM', 'AZAM_PAY', 'MANUAL_MOBILE'
+  transactionRef  String?
+
+  userId          String?
+  user            User?         @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  items           OrderItem[]
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
 }
 
 model OrderItem {
-  id        String  @id @default(uuid())
+  id        String   @id @default(uuid())
   orderId   String
   productId String
   quantity  Int
   unitPrice Float
-  order     Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
-  product   Product @relation(fields: [productId], references: [id])
+  order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
 
+// ==========================================
+// ADMIN MODEL
+// ==========================================
 model Admin {
   id        String   @id @default(uuid())
   email     String   @unique
   password  String
+  name      String?
   createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }

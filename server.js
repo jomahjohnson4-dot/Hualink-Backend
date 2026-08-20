@@ -11,7 +11,7 @@ dotenv.config();
 import httpLogger from './src/middleware/httpLogger.js';
 import errorHandler from './src/middleware/errorHandler.js';
 import logger from './src/utils/logger.js';
-import prisma from './src/prismaClient.js';
+import prisma from './src/utils/prismaClient.js';
 
 // Import Routes
 import authRoutes from './src/routes/authRoutes.js';
@@ -19,6 +19,8 @@ import productRoutes from './src/routes/productRoutes.js';
 import orderRoutes from './src/routes/orderRoutes.js';
 import analyticsRoutes from './src/routes/analyticsRoutes.js';
 import serviceRoutes from './src/routes/serviceRoutes.js';
+import paymentRoutes from './src/routes/paymentRoutes.js';
+import inventoryRoutes from './src/routes/inventoryRoutes.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -41,6 +43,7 @@ const allowedOrigins = [
   'http://127.0.0.1:5173',
   'http://localhost:3000',
   'http://127.0.0.1:3000',
+  'https://hualink-frontend.vercel.app', // Production Vercel App
 ];
 
 const corsOptions = {
@@ -48,10 +51,11 @@ const corsOptions = {
     // Allow non-browser requests (Postman, curl, server-to-server)
     if (!origin) return callback(null, true);
 
-    // Allow exact matches or local area network IPs (192.168.x.x / 10.x.x.x)
+    // Check exact origins, LAN IPs, or Vercel preview deployment URLs (*.vercel.app)
     const isAllowed =
       allowedOrigins.includes(origin) ||
-      /^http:\/\/(192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+):(5173|3000)$/.test(origin);
+      /^http:\/\/(192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+):(5173|3000)$/.test(origin) ||
+      /^https:\/\/hualink-frontend.*\.vercel\.app$/.test(origin);
 
     if (isAllowed) {
       callback(null, true);
@@ -60,7 +64,7 @@ const corsOptions = {
     }
   },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'x-signature'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'x-signature', 'x-selcom-signature'],
   credentials: true,
   optionsSuccessStatus: 200,
 };
@@ -104,8 +108,10 @@ app.use('/api/products', productRoutes);
 app.use('/api/orders', orderRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/services', serviceRoutes);
+app.use('/api/payments', paymentRoutes);
+app.use('/api/inventory', inventoryRoutes);
 
-// 6. 404 Route Fallback (Updated path syntax)
+// 6. 404 Route Fallback
 app.use('/api', (req, res) => {
   res.status(404).json({
     success: false,

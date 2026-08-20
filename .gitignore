@@ -1,10 +1,28 @@
-
-/src/generated/prisma
-
+# Dependencies
 node_modules/
+
+# Environment variables & secrets
 .env
 .env.*
 !.env.example
+
+# Generated Prisma Client
+src/generated/prisma/
+
+# Build & distribution outputs
 dist/
 build/
+
+# Testing & Coverage
+coverage/
+.jest/
+
+# System & Application logs
 *.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Operating System files
+.DS_Store
+Thumbs.db

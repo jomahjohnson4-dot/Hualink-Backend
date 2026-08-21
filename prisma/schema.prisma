@@ -37,12 +37,12 @@ enum PaymentStatus {
 // USER & AUTHENTICATION MODELS
 // ==========================================
 model User {
-  id          String   @id @default(uuid())
-  email       String   @unique
+  id          String    @id @default(uuid())
+  email       String    @unique
   password    String
   name        String
   phone       String?
-  role        Role     @default(CUSTOMER)
+  role        Role      @default(CUSTOMER)
 
   // B2B Business & Supplier Fields
   companyName String?
@@ -91,25 +91,25 @@ model Service {
 // E-COMMERCE PRODUCTS & VARIANTS
 // ==========================================
 model Product {
-  id               String      @id @default(uuid())
-  name             String
-  sku              String?     @unique
-  category         String
-  description      String?
-  image            String?
-  basePrice        Float
-  wholesalePrice   Float?      // Tiered wholesale pricing for B2B users
-  minWholesaleQty  Int?        @default(10)
-  stockCount       Int         @default(0)
-  warehouseLocation String?    @default("Main Warehouse")
+  id                String      @id @default(uuid())
+  name              String
+  sku               String?     @unique
+  category          String
+  description       String?
+  image             String?
+  basePrice         Float
+  wholesalePrice    Float?      // Tiered wholesale pricing for B2B users
+  minWholesaleQty   Int?        @default(10)
+  stockCount        Int         @default(0)
+  warehouseLocation String?     @default("Main Warehouse")
 
-  supplierId       String?
-  supplier         User?       @relation(fields: [supplierId], references: [id], onDelete: SetNull)
+  supplierId        String?
+  supplier          User?       @relation(fields: [supplierId], references: [id], onDelete: SetNull)
 
-  variants         Variant[]
-  orderItems       OrderItem[]
-  createdAt        DateTime    @default(now())
-  updatedAt        DateTime    @updatedAt
+  variants          Variant[]
+  orderItems        OrderItem[]
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
 }
 
 model Variant {
@@ -130,13 +130,16 @@ model Variant {
 model Order {
   id              String        @id @default(uuid())
   orderNumber     String        @unique
+  customerName    String?
   customerPhone   String
   shippingAddress String        @default("Default Address")
   region          String        @default("Dar es Salaam")
+  subtotal        Float         @default(0.0)
+  shippingFee     Float         @default(0.0)
   totalAmount     Float
   status          OrderStatus   @default(PENDING)
   paymentStatus   PaymentStatus @default(PENDING)
-  paymentMethod   String        @default("MANUAL_MOBILE") // e.g., 'SELCOM', 'AZAM_PAY', 'MANUAL_MOBILE'
+  paymentMethod   String        @default("MANUAL_MOBILE") // e.g., 'M-PESA', 'AZAM-PAY', 'AIRTEL-MONEY', 'HALOPESA', 'MIXX-BY-YAS'
   transactionRef  String?
 
   userId          String?
@@ -151,7 +154,7 @@ model OrderItem {
   id        String   @id @default(uuid())
   orderId   String
   productId String
-  quantity  Int
+  quantity  Int      @default(1)
   unitPrice Float
   order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
   product   Product  @relation(fields: [productId], references: [id], onDelete: Restrict)

@@ -1,10 +1,21 @@
 import crypto from 'crypto';
 import { prisma } from '../utils/prismaClient.js';
 
-// Create a new order safely
+/**
+ * Create a new order tied to an authenticated user
+ */
 export const createOrder = async (req, res, next) => {
   try {
     const rawUserId = req.user?.id;
+
+    // Reject request if user is not authenticated
+    if (!rawUserId) {
+      return res.status(401).json({
+        success: false,
+        message: 'Authentication required. Please log in to place an order.',
+      });
+    }
+
     const {
       items,
       totalAmount,
@@ -14,7 +25,10 @@ export const createOrder = async (req, res, next) => {
       customerPhone,
       phone,
       shippingAddress,
+      deliveryAddress,
       region,
+      deliveryRegion,
+      customerName,
     } = req.body;
 
     // 1. Guard against empty items array
@@ -25,51 +39,68 @@ export const createOrder = async (req, res, next) => {
       });
     }
 
-    // 2. Resolve field naming variations
+    // 2. Resolve field naming variations between frontend payload and backend schema
     const finalPhone = customerPhone || phone || customerDetails?.phone || 'N/A';
     const finalAddress =
-      shippingAddress || shippingDetails?.address || customerDetails?.address || 'Default Address';
-    const finalRegion = region || shippingDetails?.region || 'Dar es Salaam';
+      deliveryAddress || shippingAddress || shippingDetails?.address || customerDetails?.address || 'Default Address';
+    const finalRegion = deliveryRegion || region || shippingDetails?.region || 'Dar es Salaam';
+    const finalCustomerName = customerName || customerDetails?.name || req.user?.name || 'Customer';
 
-    // 3. Compute total order amount safely
-    const parsedTotal = totalAmount
-      ? parseFloat(totalAmount)
-      : items.reduce(
-          (sum, item) =>
-            sum +
-            parseInt(item.quantity || 1, 10) *
-              parseFloat(item.price || item.unitPrice || 0),
-          0
-        );
+    // 3. Verify user exists in User table
+    const userExists = await prisma.user.findUnique({
+      where: { id: rawUserId },
+      select: { id: true },
+    });
 
-    // 4. Verify user exists in User table to prevent P2003 foreign key crash
-    let validUserId = null;
-    if (rawUserId) {
-      const userExists = await prisma.user.findUnique({
-        where: { id: rawUserId },
-        select: { id: true },
+    if (!userExists) {
+      return res.status(404).json({
+        success: false,
+        message: 'User account not found. Please log in again.',
       });
-      if (userExists) {
-        validUserId = userExists.id;
-      }
     }
 
-    // 5. Construct item payloads safely
-    const orderItemsData = items.map((item) => ({
-      productId: item.productId || item.id,
-      quantity: parseInt(item.quantity || 1, 10),
-      unitPrice: parseFloat(item.price || item.unitPrice || 0),
-    }));
+    // 4. Extract product IDs and fetch prices from Database if not provided
+    const productIds = items.map((i) => i.productId || i.id).filter(Boolean);
+    const dbProducts = await prisma.product.findMany({
+      where: { id: { in: productIds } },
+      select: { id: true, price: true },
+    });
+
+    const productMap = new Map(dbProducts.map((p) => [p.id, Number(p.price)]));
+
+    // Construct item payloads safely
+    const orderItemsData = items.map((item) => {
+      const pid = item.productId || item.id;
+      const dbPrice = productMap.get(pid);
+      const fallbackPrice = item.unitPrice ?? item.price ?? 0;
+      const finalUnitPrice = dbPrice !== undefined ? dbPrice : parseFloat(fallbackPrice);
+
+      return {
+        productId: pid,
+        quantity: parseInt(item.quantity || 1, 10),
+        unitPrice: finalUnitPrice,
+      };
+    });
+
+    // 5. Compute total order amount safely
+    const computedSubtotal = orderItemsData.reduce(
+      (sum, item) => sum + item.quantity * item.unitPrice,
+      0
+    );
+    const parsedTotal = totalAmount ? parseFloat(totalAmount) : computedSubtotal;
 
     // 6. Database record creation
     const newOrder = await prisma.order.create({
       data: {
-        ...(validUserId && { userId: validUserId }),
+        userId: userExists.id,
+        orderNumber: `ORD-${Date.now()}`,
         totalAmount: parsedTotal,
+        customerName: finalCustomerName,
         customerPhone: finalPhone,
-        paymentMethod: paymentMethod || 'CASH',
+        paymentMethod: paymentMethod || 'M-PESA',
         shippingAddress: finalAddress,
         region: finalRegion,
+        status: 'PENDING',
         items: {
           create: orderItemsData,
         },
@@ -77,11 +108,14 @@ export const createOrder = async (req, res, next) => {
       include: { items: true },
     });
 
-    return res.status(201).json({ success: true, data: newOrder });
+    return res.status(201).json({
+      success: true,
+      message: 'Order placed successfully',
+      data: newOrder,
+    });
   } catch (error) {
     console.error('CREATE ORDER ERROR DETAILED:', error);
 
-    // Provide explicit error payload for rapid debugging
     return res.status(500).json({
       success: false,
       message: error.message || 'Internal server error while placing order.',
@@ -91,11 +125,17 @@ export const createOrder = async (req, res, next) => {
   }
 };
 
-// Get all orders (Restricted by User Role)
+/**
+ * Retrieve user orders (Restricted by User Role)
+ */
 export const getOrders = async (req, res, next) => {
   try {
     const userId = req.user?.id;
     const userRole = (req.user?.role || '').toUpperCase();
+
+    if (!userId) {
+      return res.status(401).json({ success: false, message: 'Unauthorized' });
+    }
 
     // Standard users retrieve their own orders; admins retrieve all
     const whereClause = userRole === 'ADMIN' ? {} : { userId };
@@ -112,10 +152,11 @@ export const getOrders = async (req, res, next) => {
   }
 };
 
-// Backwards compatibility alias
 export const getAllOrders = getOrders;
 
-// Get order by ID
+/**
+ * Get order by ID with ownership check
+ */
 export const getOrderById = async (req, res, next) => {
   try {
     const { id } = req.params;
@@ -142,7 +183,9 @@ export const getOrderById = async (req, res, next) => {
   }
 };
 
-// Update order status
+/**
+ * Update order status
+ */
 export const updateOrderStatus = async (req, res, next) => {
   try {
     const { id } = req.params;
@@ -163,7 +206,9 @@ export const updateOrderStatus = async (req, res, next) => {
   }
 };
 
-// Secure Payment Webhook Handler
+/**
+ * Secure Payment Webhook Handler
+ */
 export const handlePaymentWebhook = async (req, res, next) => {
   try {
     const signature = req.headers['x-signature'];

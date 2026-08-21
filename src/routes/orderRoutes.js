@@ -1,10 +1,12 @@
-// routes/orderRoutes.js
 import { Router } from 'express';
 import db from '../config/db.js';
 import { validateOrderPayload } from '../middleware/orderValidation.js';
 import { verifyToken, restrictTo } from '../middleware/auth.js';
 
 const router = Router();
+
+// In-memory store for active SSE clients listening for payment updates
+const paymentClients = new Map();
 
 // -----------------------------------------------------------------------------
 // CONTROLLER HANDLERS
@@ -18,7 +20,15 @@ export const createOrder = async (req, res) => {
 
   try {
     const userId = req.user.id;
-    const { items, totalAmount, shippingAddress, phone, region, paymentMethod } = req.body;
+    const {
+      customerName,
+      customerPhone,
+      deliveryRegion,
+      deliveryAddress,
+      paymentMethod,
+      totalAmount,
+      items,
+    } = req.body;
 
     if (!items || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ message: 'Cart items are required.' });
@@ -29,20 +39,22 @@ export const createOrder = async (req, res) => {
 
     // 1. Insert main order record
     const newOrder = await client.query(
-      `INSERT INTO orders (user_id, total_amount, shipping_address, phone, region, payment_method, status)
-       VALUES ($1, $2, $3, $4, $5, $6, 'Pending') 
+      `INSERT INTO orders (user_id, customer_name, phone, region, shipping_address, payment_method, total_amount, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'Pending') 
        RETURNING *`,
-      [userId, totalAmount, shippingAddress, phone, region, paymentMethod]
+      [userId, customerName, customerPhone, deliveryRegion, deliveryAddress, paymentMethod, totalAmount]
     );
 
     const orderId = newOrder.rows[0].id;
+    const orderNumber = newOrder.rows[0].order_number || `ORD-${orderId}`;
 
     // 2. Save individual order items
     for (const item of items) {
+      const price = item.unitPrice ?? item.price;
       await client.query(
         `INSERT INTO order_items (order_id, product_id, quantity, price)
          VALUES ($1, $2, $3, $4)`,
-        [orderId, item.productId, item.quantity, item.price]
+        [orderId, item.productId, item.quantity, price]
       );
     }
 
@@ -50,9 +62,12 @@ export const createOrder = async (req, res) => {
     await client.query('COMMIT');
 
     res.status(201).json({
+      success: true,
       message: 'Order placed successfully',
       data: {
         id: orderId,
+        orderId: orderId,
+        orderNumber,
         status: 'Pending',
         totalAmount,
       },
@@ -124,7 +139,24 @@ export const getOrderById = async (req, res) => {
 };
 
 /**
- * Payment gateway callback handler
+ * SSE Endpoint for streaming payment updates to the frontend
+ */
+export const streamPaymentStatus = (req, res) => {
+  const { orderId } = req.params;
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+
+  paymentClients.set(String(orderId), res);
+
+  req.on('close', () => {
+    paymentClients.delete(String(orderId));
+  });
+};
+
+/**
+ * Payment gateway callback handler (updates DB & notifies SSE clients)
  */
 export const handlePaymentWebhook = async (req, res) => {
   try {
@@ -135,6 +167,13 @@ export const handlePaymentWebhook = async (req, res) => {
     }
 
     await db.query('UPDATE orders SET status = $1 WHERE id = $2', [status, orderId]);
+
+    // Push update live to SSE client listening on frontend
+    const clientRes = paymentClients.get(String(orderId));
+    if (clientRes) {
+      clientRes.write(`data: ${JSON.stringify({ orderId, status })}\n\n`);
+    }
+
     res.status(200).json({ message: 'Webhook processed successfully' });
   } catch (error) {
     console.error('Webhook Error:', error);
@@ -148,6 +187,7 @@ export const handlePaymentWebhook = async (req, res) => {
 
 // PUBLIC ENDPOINTS
 router.post('/payment-webhook', handlePaymentWebhook);
+router.get('/payments/stream/:orderId', streamPaymentStatus);
 
 // PROTECTED ENDPOINTS (Requires Valid JWT Bearer Token)
 router.use(verifyToken);

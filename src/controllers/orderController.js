@@ -1,5 +1,60 @@
 import crypto from 'crypto';
 import { prisma } from '../utils/prismaClient.js';
+import { sendSMS } from '../utils/smsService.js';
+import { initiatePaymentService } from '../services/paymentService.js';
+
+/**
+ * Standard relation include configuration for fetching readable product details inside items.
+ * Supports both `items` and `orderItems` schema variants dynamically.
+ */
+const orderIncludeWithProducts = {
+  items: {
+    include: {
+      product: {
+        select: {
+          id: true,
+          name: true,
+          image: true,
+          sku: true,
+          category: true,
+          basePrice: true,
+        },
+      },
+    },
+  },
+};
+
+const orderIncludeWithOrderItems = {
+  orderItems: {
+    include: {
+      product: {
+        select: {
+          id: true,
+          name: true,
+          image: true,
+          sku: true,
+          category: true,
+          basePrice: true,
+        },
+      },
+    },
+  },
+};
+
+/**
+ * Helper to execute Prisma queries supporting both `items` and `orderItems` relation names
+ */
+const queryWithFallback = async (primaryFn, fallbackFn) => {
+  try {
+    return await primaryFn();
+  } catch (err) {
+    // If Prisma error indicates missing relation field 'items', fallback to 'orderItems'
+    if (err.message && (err.message.includes('items') || err.code === 'P2002' || err.code === 'P2009')) {
+      return await fallbackFn();
+    }
+    throw err;
+  }
+};
 
 /**
  * Create a new order tied to an authenticated user
@@ -59,59 +114,161 @@ export const createOrder = async (req, res, next) => {
       });
     }
 
-    // 4. Extract product IDs and fetch prices from Database if not provided
-    const productIds = items.map((i) => i.productId || i.id).filter(Boolean);
-    const dbProducts = await prisma.product.findMany({
-      where: { id: { in: productIds } },
-      select: { id: true, price: true },
-    });
+    // 4. Extract product IDs cleanly
+    const productIds = items
+      .map((i) => i.productId || i.id)
+      .filter((id) => id !== null && id !== undefined && id !== '');
 
-    const productMap = new Map(dbProducts.map((p) => [p.id, Number(p.price)]));
+    // 5. Execute DB Transaction (Create Order + Deduct Inventory Stock)
+    let newOrder;
+    try {
+      newOrder = await prisma.$transaction(async (tx) => {
+        // Fetch matching database products
+        const dbProducts = productIds.length > 0 
+          ? await tx.product.findMany({
+              where: { id: { in: productIds } },
+              select: { id: true, basePrice: true, stockCount: true, name: true, image: true },
+            })
+          : [];
 
-    // Construct item payloads safely
-    const orderItemsData = items.map((item) => {
-      const pid = item.productId || item.id;
-      const dbPrice = productMap.get(pid);
-      const fallbackPrice = item.unitPrice ?? item.price ?? 0;
-      const finalUnitPrice = dbPrice !== undefined ? dbPrice : parseFloat(fallbackPrice);
+        const productMap = new Map(
+          dbProducts.map((p) => [
+            p.id, 
+            { 
+              basePrice: Number(p.basePrice || 0), 
+              stockCount: p.stockCount || 0, 
+              name: p.name || 'Unknown Item',
+              image: p.image || null
+            }
+          ])
+        );
 
-      return {
-        productId: pid,
-        quantity: parseInt(item.quantity || 1, 10),
-        unitPrice: finalUnitPrice,
-      };
-    });
+        // Construct order item payloads & check stock availability
+        const orderItemsData = [];
+        for (const item of items) {
+          const pid = item.productId || item.id;
+          const dbProduct = productMap.get(pid);
+          
+          const fallbackPrice = item.unitPrice ?? item.price ?? item.basePrice ?? 0;
+          const finalUnitPrice = dbProduct ? dbProduct.basePrice : parseFloat(fallbackPrice);
+          const qty = Math.max(1, parseInt(item.quantity || 1, 10));
+          
+          // Resolve product name string explicitly
+          const resolvedName = dbProduct?.name || item.name || item.productName || 'Order Item';
 
-    // 5. Compute total order amount safely
-    const computedSubtotal = orderItemsData.reduce(
-      (sum, item) => sum + item.quantity * item.unitPrice,
-      0
-    );
-    const parsedTotal = totalAmount ? parseFloat(totalAmount) : computedSubtotal;
+          const orderItemPayload = {
+            quantity: qty,
+            unitPrice: finalUnitPrice,
+            price: finalUnitPrice, // Backwards compatibility field
+            name: resolvedName,
+            productName: resolvedName, // Backwards compatibility field
+            ...(pid ? { productId: pid } : {}),
+          };
 
-    // 6. Database record creation
-    const newOrder = await prisma.order.create({
-      data: {
-        userId: userExists.id,
-        orderNumber: `ORD-${Date.now()}`,
-        totalAmount: parsedTotal,
-        customerName: finalCustomerName,
-        customerPhone: finalPhone,
-        paymentMethod: paymentMethod || 'M-PESA',
-        shippingAddress: finalAddress,
-        region: finalRegion,
-        status: 'PENDING',
-        items: {
-          create: orderItemsData,
-        },
-      },
-      include: { items: true },
-    });
+          orderItemsData.push(orderItemPayload);
 
+          // Deduct inventory stock if product exists in Database
+          if (dbProduct && pid) {
+            await tx.product.update({
+              where: { id: pid },
+              data: { stockCount: { decrement: qty } },
+            });
+          }
+        }
+
+        // Compute total order amount safely
+        const computedSubtotal = orderItemsData.reduce(
+          (sum, item) => sum + item.quantity * item.unitPrice,
+          0
+        );
+        const parsedTotal = totalAmount ? parseFloat(totalAmount) : computedSubtotal;
+
+        const orderBaseData = {
+          userId: userExists.id,
+          orderNumber: `ORD-${Date.now()}`,
+          totalAmount: parsedTotal,
+          customerName: finalCustomerName,
+          customerPhone: finalPhone,
+          paymentMethod: paymentMethod || 'AIRTEL-MONEY',
+          shippingAddress: finalAddress,
+          region: finalRegion,
+          status: 'PENDING',
+          paymentStatus: 'PENDING',
+        };
+
+        // Attempt creation using `items` first, falling back to `orderItems` relation
+        return await queryWithFallback(
+          () =>
+            tx.order.create({
+              data: {
+                ...orderBaseData,
+                items: { create: orderItemsData },
+              },
+              include: orderIncludeWithProducts,
+            }),
+          () =>
+            tx.order.create({
+              data: {
+                ...orderBaseData,
+                orderItems: { create: orderItemsData },
+              },
+              include: orderIncludeWithOrderItems,
+            })
+        );
+      });
+    } catch (dbErr) {
+      console.error('DATABASE TRANSACTION FAILED:', dbErr);
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to record order into database.',
+        error: dbErr.message,
+      });
+    }
+
+    // 6. Attempt Payment Initiation
+    let paymentInitiated = false;
+    let paymentWarning = null;
+
+    if (finalPhone && finalPhone !== 'N/A') {
+      try {
+        await initiatePaymentService({
+          orderId: newOrder.id,
+          phone: finalPhone,
+          amount: newOrder.totalAmount,
+          provider: paymentMethod || 'AIRTEL-MONEY',
+        });
+        paymentInitiated = true;
+      } catch (payErr) {
+        console.warn('[PAYMENT INITIATION WARNING]:', payErr.message);
+        paymentWarning = payErr.message;
+      }
+    }
+
+    // 7. Send NextSMS confirmation asynchronously
+    if (finalPhone && finalPhone !== 'N/A') {
+      const smsMessage = `Habari ${finalCustomerName}, oda yako #${newOrder.orderNumber} ya TSH ${Number(
+        newOrder.totalAmount
+      ).toLocaleString()} imepokelewa. Hali: PENDING. Hualink.`;
+
+      sendSMS(finalPhone, smsMessage).catch((err) =>
+        console.error('SMS notification error:', err.message)
+      );
+    }
+
+    // Normalize returned object so frontend always receives an `items` array
+    const responseData = {
+      ...newOrder,
+      items: newOrder.items || newOrder.orderItems || [],
+    };
+
+    // 8. Return 201 Created Response
     return res.status(201).json({
       success: true,
-      message: 'Order placed successfully',
-      data: newOrder,
+      message: paymentInitiated
+        ? 'Order created and payment prompt dispatched successfully.'
+        : 'Order created successfully.',
+      data: responseData,
+      ...(paymentWarning && { paymentWarning }),
     });
   } catch (error) {
     console.error('CREATE ORDER ERROR DETAILED:', error);
@@ -126,7 +283,7 @@ export const createOrder = async (req, res, next) => {
 };
 
 /**
- * Retrieve user orders (Restricted by User Role)
+ * Retrieve user orders (Restricted by User Role, Includes Product Names)
  */
 export const getOrders = async (req, res, next) => {
   try {
@@ -140,13 +297,28 @@ export const getOrders = async (req, res, next) => {
     // Standard users retrieve their own orders; admins retrieve all
     const whereClause = userRole === 'ADMIN' ? {} : { userId };
 
-    const orders = await prisma.order.findMany({
-      where: whereClause,
-      include: { items: true },
-      orderBy: { createdAt: 'desc' },
-    });
+    const rawOrders = await queryWithFallback(
+      () =>
+        prisma.order.findMany({
+          where: whereClause,
+          include: orderIncludeWithProducts,
+          orderBy: { createdAt: 'desc' },
+        }),
+      () =>
+        prisma.order.findMany({
+          where: whereClause,
+          include: orderIncludeWithOrderItems,
+          orderBy: { createdAt: 'desc' },
+        })
+    );
 
-    return res.status(200).json({ success: true, data: orders });
+    // Normalize response array so `items` is populated even if database uses `orderItems`
+    const normalizedOrders = rawOrders.map((order) => ({
+      ...order,
+      items: order.items || order.orderItems || [],
+    }));
+
+    return res.status(200).json({ success: true, data: normalizedOrders });
   } catch (error) {
     next(error);
   }
@@ -155,7 +327,7 @@ export const getOrders = async (req, res, next) => {
 export const getAllOrders = getOrders;
 
 /**
- * Get order by ID with ownership check
+ * Get order by ID with ownership check (Includes Detailed Product Names)
  */
 export const getOrderById = async (req, res, next) => {
   try {
@@ -163,10 +335,18 @@ export const getOrderById = async (req, res, next) => {
     const userId = req.user?.id;
     const userRole = (req.user?.role || '').toUpperCase();
 
-    const order = await prisma.order.findUnique({
-      where: { id },
-      include: { items: true },
-    });
+    const order = await queryWithFallback(
+      () =>
+        prisma.order.findUnique({
+          where: { id },
+          include: orderIncludeWithProducts,
+        }),
+      () =>
+        prisma.order.findUnique({
+          where: { id },
+          include: orderIncludeWithOrderItems,
+        })
+    );
 
     if (!order) {
       return res.status(404).json({ success: false, message: 'Order not found' });
@@ -177,37 +357,67 @@ export const getOrderById = async (req, res, next) => {
       return res.status(403).json({ success: false, message: 'Access denied' });
     }
 
-    return res.status(200).json({ success: true, data: order });
+    const normalizedOrder = {
+      ...order,
+      items: order.items || order.orderItems || [],
+    };
+
+    return res.status(200).json({ success: true, data: normalizedOrder });
   } catch (error) {
     next(error);
   }
 };
 
 /**
- * Update order status
+ * Update order status & send SMS update notification
  */
 export const updateOrderStatus = async (req, res, next) => {
   try {
     const { id } = req.params;
     const { status, paymentStatus } = req.body;
 
-    const updatedOrder = await prisma.order.update({
-      where: { id },
-      data: {
-        ...(status && { status }),
-        ...(paymentStatus && { paymentStatus }),
-      },
-      include: { items: true },
-    });
+    const updatedOrder = await queryWithFallback(
+      () =>
+        prisma.order.update({
+          where: { id },
+          data: {
+            ...(status && { status }),
+            ...(paymentStatus && { paymentStatus }),
+          },
+          include: orderIncludeWithProducts,
+        }),
+      () =>
+        prisma.order.update({
+          where: { id },
+          data: {
+            ...(status && { status }),
+            ...(paymentStatus && { paymentStatus }),
+          },
+          include: orderIncludeWithOrderItems,
+        })
+    );
 
-    return res.status(200).json({ success: true, data: updatedOrder });
+    // Send Status Update Notification via NextSMS
+    if (status && updatedOrder.customerPhone && updatedOrder.customerPhone !== 'N/A') {
+      const smsMessage = `Habari ${updatedOrder.customerName}, hali ya oda yako #${updatedOrder.orderNumber} imebadilishwa kuwa: ${status}. Ahsante kwa kutumia Hualink!`;
+      sendSMS(updatedOrder.customerPhone, smsMessage).catch((err) =>
+        console.error('SMS notification error:', err.message)
+      );
+    }
+
+    const normalizedOrder = {
+      ...updatedOrder,
+      items: updatedOrder.items || updatedOrder.orderItems || [],
+    };
+
+    return res.status(200).json({ success: true, data: normalizedOrder });
   } catch (error) {
     next(error);
   }
 };
 
 /**
- * Secure Payment Webhook Handler
+ * Secure Payment Webhook Handler (Accepts ID or OrderNumber)
  */
 export const handlePaymentWebhook = async (req, res, next) => {
   try {
@@ -234,29 +444,68 @@ export const handlePaymentWebhook = async (req, res, next) => {
       }
     }
 
-    const { orderId, status, transactionId, transactionRef } = req.body;
+    const { orderId, externalId, status, transactionId, transactionRef } = req.body;
+    const identifier = orderId || externalId;
 
-    if (!orderId || !status) {
+    if (!identifier || !status) {
       return res.status(400).json({
         success: false,
-        message: 'Missing required orderId or status parameter',
+        message: 'Missing required order identifier (orderId/externalId) or status parameter',
       });
     }
 
     const ref = transactionRef || transactionId;
 
-    const updatedOrder = await prisma.order.update({
-      where: { id: orderId },
-      data: {
-        paymentStatus: status,
-        ...(ref && { transactionRef: ref }),
+    // Find target order by UUID primary key or orderNumber
+    const existingOrder = await prisma.order.findFirst({
+      where: {
+        OR: [{ id: identifier }, { orderNumber: identifier }],
       },
     });
+
+    if (!existingOrder) {
+      return res.status(404).json({
+        success: false,
+        message: `Order with identifier ${identifier} not found`,
+      });
+    }
+
+    const isSuccess = ['SUCCESS', 'COMPLETED', 'PAID', 'SUCCESSFUL'].includes(
+      status.toUpperCase()
+    );
+
+    const updatedOrder = await queryWithFallback(
+      () =>
+        prisma.order.update({
+          where: { id: existingOrder.id },
+          data: {
+            paymentStatus: isSuccess ? 'PAID' : 'FAILED',
+            ...(isSuccess ? { status: 'CONFIRMED' } : {}),
+            ...(ref && { transactionRef: ref }),
+          },
+          include: orderIncludeWithProducts,
+        }),
+      () =>
+        prisma.order.update({
+          where: { id: existingOrder.id },
+          data: {
+            paymentStatus: isSuccess ? 'PAID' : 'FAILED',
+            ...(isSuccess ? { status: 'CONFIRMED' } : {}),
+            ...(ref && { transactionRef: ref }),
+          },
+          include: orderIncludeWithOrderItems,
+        })
+    );
+
+    const normalizedOrder = {
+      ...updatedOrder,
+      items: updatedOrder.items || updatedOrder.orderItems || [],
+    };
 
     return res.status(200).json({
       success: true,
       message: 'Payment status verified and updated successfully',
-      data: updatedOrder,
+      data: normalizedOrder,
     });
   } catch (error) {
     next(error);

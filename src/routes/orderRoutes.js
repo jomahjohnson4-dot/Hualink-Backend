@@ -1,25 +1,99 @@
 import { Router } from 'express';
-import db from '../config/db.js';
+import { PrismaClient } from '@prisma/client';
+import { PrismaPg } from '@prisma/adapter-pg';
+import pg from 'pg';
+import dotenv from 'dotenv';
 import { validateOrderPayload } from '../middleware/orderValidation.js';
-import { verifyToken, restrictTo } from '../middleware/auth.js';
+import { verifyToken } from '../middleware/auth.js';
+import { sendSMS } from '../utils/smsService.js';
+
+dotenv.config();
+
+const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+const adapter = new PrismaPg(pool);
+const prisma = new PrismaClient({ adapter });
 
 const router = Router();
-
-// In-memory store for active SSE clients listening for payment updates
 const paymentClients = new Map();
 
-// -----------------------------------------------------------------------------
-// CONTROLLER HANDLERS
-// -----------------------------------------------------------------------------
+/**
+ * Helper to format phone number to international format (255XXXXXXXXX)
+ */
+const formatTanzaniaPhone = (phone) => {
+  let cleaned = String(phone).replace(/\D/g, '');
+  if (cleaned.startsWith('0')) {
+    cleaned = '255' + cleaned.substring(1);
+  }
+  return cleaned;
+};
 
 /**
- * Create a new order in PostgreSQL using a Database Transaction
+ * Map frontend payment method strings AND phone number prefixes to AzamPay Provider codes
+ */
+const getAzamPayProvider = (method, phoneNumber = '') => {
+  const normalized = String(method || '').toUpperCase();
+  const cleanedPhone = formatTanzaniaPhone(phoneNumber);
+
+  // 1. Check explicit provider string from frontend
+  if (normalized.includes('AIRTEL')) return 'AIRTEL';
+  if (normalized.includes('MPESA') || normalized.includes('M-PESA') || normalized.includes('VODACOM')) return 'M-PESA';
+  if (normalized.includes('HALO') || normalized.includes('HALOPESA')) return 'HALOPESA';
+  if (normalized.includes('TIGO') || normalized.includes('YAS') || normalized.includes('MIXX')) return 'TIGO';
+  if (normalized.includes('AZAM')) return 'AZAMPAY';
+
+  // 2. Fallback: Auto-detect provider directly from Tanzanian phone prefixes
+  if (/^255(78|68|69)/.test(cleanedPhone)) return 'AIRTEL';
+  if (/^255(74|75|76)/.test(cleanedPhone)) return 'M-PESA';
+  if (/^255(65|67|71|77)/.test(cleanedPhone)) return 'TIGO';
+  if (/^25562/.test(cleanedPhone)) return 'HALOPESA';
+
+  return 'M-PESA';
+};
+
+/**
+ * Helper function to trigger AzamPay Sandbox payment gateway USSD push API
+ */
+const initiateMobileMoneyPush = async ({ phoneNumber, amount, orderNumber, paymentMethod }) => {
+  const formattedPhone = formatTanzaniaPhone(phoneNumber);
+  const provider = getAzamPayProvider(paymentMethod, phoneNumber);
+
+  console.log(`[AZAMPAY SANDBOX] Initiating ${provider} push to ${formattedPhone} for ${amount} TZS`);
+
+  if (process.env.AZAMPAY_AUTH_TOKEN) {
+    const response = await fetch('https://sandbox.azampay.co.tz/azampay/mno/checkout', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.AZAMPAY_AUTH_TOKEN}`,
+      },
+      body: JSON.stringify({
+        accountNumber: formattedPhone,
+        amount: amount.toString(),
+        currency: 'TZS',
+        externalId: orderNumber,
+        provider: provider,
+      }),
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(data.message || `AzamPay push failed for provider ${provider}`);
+    }
+
+    return { ...data, resolvedProvider: provider };
+  }
+
+  console.warn('[PAYMENT GATEWAY] Missing AZAMPAY_AUTH_TOKEN in .env file.');
+  return { success: true, message: 'Mock USSD prompt dispatched', resolvedProvider: provider };
+};
+
+/**
+ * Create a new order using Prisma Client
  */
 export const createOrder = async (req, res) => {
-  const client = await db.getClient ? await db.getClient() : await db.connect();
-
   try {
-    const userId = req.user.id;
+    const userId = req.user?.id || null;
     const {
       customerName,
       customerPhone,
@@ -34,52 +108,90 @@ export const createOrder = async (req, res) => {
       return res.status(400).json({ message: 'Cart items are required.' });
     }
 
-    // Begin ACID transaction
-    await client.query('BEGIN');
+    const calculatedTotal = Number(totalAmount);
+    if (calculatedTotal <= 0) {
+      return res.status(400).json({ message: 'Order total amount must be greater than 0 TZS.' });
+    }
 
-    // 1. Insert main order record
-    const newOrder = await client.query(
-      `INSERT INTO orders (user_id, customer_name, phone, region, shipping_address, payment_method, total_amount, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, 'Pending') 
-       RETURNING *`,
-      [userId, customerName, customerPhone, deliveryRegion, deliveryAddress, paymentMethod, totalAmount]
-    );
+    const orderNumber = `HL-${Date.now().toString().slice(-6)}`;
+    const resolvedProvider = getAzamPayProvider(paymentMethod, customerPhone);
 
-    const orderId = newOrder.rows[0].id;
-    const orderNumber = newOrder.rows[0].order_number || `ORD-${orderId}`;
+    // Verify user exists in database
+    let validUserId = null;
+    if (userId) {
+      const existingUser = await prisma.user.findUnique({ where: { id: userId } });
+      if (existingUser) validUserId = existingUser.id;
+    }
 
-    // 2. Save individual order items
-    for (const item of items) {
-      const price = item.unitPrice ?? item.price;
-      await client.query(
-        `INSERT INTO order_items (order_id, product_id, quantity, price)
-         VALUES ($1, $2, $3, $4)`,
-        [orderId, item.productId, item.quantity, price]
+    // 1. Create Order in database
+    const newOrder = await prisma.order.create({
+      data: {
+        orderNumber,
+        ...(validUserId && { userId: validUserId }),
+        customerName: customerName || 'Valued Customer',
+        customerPhone,
+        region: deliveryRegion || 'Dar es Salaam',
+        shippingAddress: deliveryAddress || 'N/A',
+        paymentMethod: resolvedProvider,
+        totalAmount: calculatedTotal,
+        status: 'PENDING',
+        paymentStatus: 'PENDING',
+        items: {
+          create: items.map((item) => ({
+            productId: item.productId,
+            quantity: item.quantity,
+            unitPrice: Number(item.unitPrice ?? item.price),
+          })),
+        },
+      },
+      include: { items: true },
+    });
+
+    // 2. Trigger USSD push to customer's phone
+    try {
+      await initiateMobileMoneyPush({
+        phoneNumber: customerPhone,
+        amount: calculatedTotal,
+        orderNumber: newOrder.orderNumber,
+        paymentMethod: resolvedProvider,
+      });
+    } catch (payErr) {
+      console.error('Failed to dispatch payment prompt:', payErr.message || payErr);
+
+      await prisma.order.update({
+        where: { id: newOrder.id },
+        data: { status: 'CANCELLED', paymentStatus: 'FAILED' },
+      });
+
+      return res.status(400).json({
+        success: false,
+        message: `Failed to dispatch ${resolvedProvider} payment prompt: ${payErr.message}`,
+      });
+    }
+
+    // 3. Send Order Confirmation via NextSMS (Non-blocking)
+    if (customerPhone) {
+      const smsMessage = `Habari ${newOrder.customerName}, oda yako #${newOrder.orderNumber} ya TSH ${calculatedTotal.toLocaleString()} imepokelewa. Tafadhali thibitisha malipo kwenye simu yako. Hualink.`;
+      sendSMS(customerPhone, smsMessage).catch((err) =>
+        console.error('[SMS Dispatch Error]:', err.message || err)
       );
     }
 
-    // Commit transaction to finalize updates
-    await client.query('COMMIT');
-
     res.status(201).json({
       success: true,
-      message: 'Order placed successfully',
+      message: `Order placed successfully. Please check your ${resolvedProvider} phone for the payment prompt.`,
       data: {
-        id: orderId,
-        orderId: orderId,
-        orderNumber,
-        status: 'Pending',
-        totalAmount,
+        id: newOrder.id,
+        orderId: newOrder.id,
+        orderNumber: newOrder.orderNumber,
+        paymentMethod: resolvedProvider,
+        status: newOrder.status,
+        totalAmount: newOrder.totalAmount,
       },
     });
   } catch (error) {
-    // Rollback any partial inserts if an error occurs
-    await client.query('ROLLBACK');
-    console.error('Database Transaction Error (Create Order):', error);
+    console.error('Prisma Error (Create Order):', error);
     res.status(500).json({ message: 'Internal server error while placing order.' });
-  } finally {
-    // Release client back to pool
-    client.release();
   }
 };
 
@@ -88,19 +200,26 @@ export const createOrder = async (req, res) => {
  */
 export const getOrders = async (req, res) => {
   try {
-    const userId = req.user.id;
-    const userRole = req.user.role;
+    const userId = req.user?.id;
+    const userRole = req.user?.role;
+    const userPhone = req.user?.phone;
 
-    let queryText = 'SELECT * FROM orders WHERE user_id = $1 ORDER BY created_at DESC';
-    let queryParams = [userId];
+    let where = {};
 
-    if (userRole === 'admin') {
-      queryText = 'SELECT * FROM orders ORDER BY created_at DESC';
-      queryParams = [];
+    if (userRole !== 'ADMIN' && userRole !== 'admin') {
+      const conditions = [];
+      if (userId) conditions.push({ userId });
+      if (userPhone) conditions.push({ customerPhone: userPhone });
+      where = conditions.length > 0 ? { OR: conditions } : {};
     }
 
-    const { rows } = await db.query(queryText, queryParams);
-    res.status(200).json({ data: rows });
+    const orders = await prisma.order.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      include: { items: true },
+    });
+
+    res.status(200).json({ data: orders });
   } catch (error) {
     console.error('Fetch Orders Error:', error);
     res.status(500).json({ message: 'Error retrieving orders.' });
@@ -108,28 +227,26 @@ export const getOrders = async (req, res) => {
 };
 
 /**
- * Retrieve specific order by ID along with its line items
+ * Retrieve specific order by ID
  */
 export const getOrderById = async (req, res) => {
   try {
     const { id } = req.params;
-    const userId = req.user.id;
-    const userRole = req.user.role;
+    const userId = req.user?.id;
+    const userRole = req.user?.role;
 
-    const orderResult = await db.query('SELECT * FROM orders WHERE id = $1', [id]);
-    if (orderResult.rows.length === 0) {
+    const order = await prisma.order.findUnique({
+      where: { id },
+      include: { items: true },
+    });
+
+    if (!order) {
       return res.status(404).json({ message: 'Order not found.' });
     }
 
-    const order = orderResult.rows[0];
-
-    // Ensure users can only access their own orders (unless admin)
-    if (order.user_id !== userId && userRole !== 'admin') {
+    if (order.userId && order.userId !== userId && userRole !== 'ADMIN' && userRole !== 'admin') {
       return res.status(403).json({ message: 'Access denied.' });
     }
-
-    const itemsResult = await db.query('SELECT * FROM order_items WHERE order_id = $1', [id]);
-    order.items = itemsResult.rows;
 
     res.status(200).json({ data: order });
   } catch (error) {
@@ -160,24 +277,63 @@ export const streamPaymentStatus = (req, res) => {
  */
 export const handlePaymentWebhook = async (req, res) => {
   try {
-    const { orderId, status } = req.body;
+    const payload = req.body || {};
 
-    if (!orderId || !status) {
-      return res.status(400).json({ message: 'Invalid webhook payload.' });
+    const targetIdentifier = payload.orderId || payload.externalId || payload.utilityref;
+    const rawStatus = String(payload.status || payload.transactionstatus || 'PAID').toUpperCase();
+
+    if (!targetIdentifier) {
+      return res.status(400).json({ message: 'Invalid webhook payload. Missing order identifier.' });
     }
 
-    await db.query('UPDATE orders SET status = $1 WHERE id = $2', [status, orderId]);
+    let existingOrder = await prisma.order.findFirst({
+      where: {
+        OR: [
+          { id: targetIdentifier },
+          { orderNumber: targetIdentifier },
+        ],
+      },
+    });
 
-    // Push update live to SSE client listening on frontend
-    const clientRes = paymentClients.get(String(orderId));
+    if (!existingOrder) {
+      return res.status(404).json({ message: `Order '${targetIdentifier}' not found in database.` });
+    }
+
+    const isSuccess = ['COMPLETED', 'SUCCESS', 'PAID', 'SUCCESSFUL'].includes(rawStatus);
+    const newStatus = isSuccess ? 'PAID' : 'FAILED';
+
+    const updatedOrder = await prisma.order.update({
+      where: { id: existingOrder.id },
+      data: {
+        status: isSuccess ? 'PROCESSING' : 'CANCELLED',
+        paymentStatus: newStatus,
+      },
+    });
+
+    // Send payment outcome SMS to customer via NextSMS
+    if (updatedOrder.customerPhone) {
+      const smsMessage = isSuccess
+        ? `Habari ${updatedOrder.customerName}, malipo ya oda yako #${updatedOrder.orderNumber} yamefanikiwa! Oda yako inashughulikiwa. Hualink.`
+        : `Habari ${updatedOrder.customerName}, malipo ya oda yako #${updatedOrder.orderNumber} yameshindikana. Tafadhali jaribu tena. Hualink.`;
+
+      sendSMS(updatedOrder.customerPhone, smsMessage).catch((err) =>
+        console.error('[SMS Webhook Notification Error]:', err.message || err)
+      );
+    }
+
+    // Notify active SSE stream connections
+    const clientRes = paymentClients.get(String(updatedOrder.id));
     if (clientRes) {
-      clientRes.write(`data: ${JSON.stringify({ orderId, status })}\n\n`);
+      clientRes.write(`data: ${JSON.stringify({ orderId: updatedOrder.id, status: newStatus })}\n\n`);
     }
 
-    res.status(200).json({ message: 'Webhook processed successfully' });
+    res.status(200).json({
+      message: 'Webhook processed successfully',
+      data: { orderId: updatedOrder.id, paymentStatus: updatedOrder.paymentStatus },
+    });
   } catch (error) {
-    console.error('Webhook Error:', error);
-    res.status(500).json({ message: 'Error processing webhook.' });
+    console.error('Webhook Error Details:', error);
+    res.status(500).json({ message: 'Error processing webhook.', error: error.message });
   }
 };
 
@@ -185,11 +341,9 @@ export const handlePaymentWebhook = async (req, res) => {
 // ROUTE DEFINITIONS
 // -----------------------------------------------------------------------------
 
-// PUBLIC ENDPOINTS
 router.post('/payment-webhook', handlePaymentWebhook);
 router.get('/payments/stream/:orderId', streamPaymentStatus);
 
-// PROTECTED ENDPOINTS (Requires Valid JWT Bearer Token)
 router.use(verifyToken);
 
 router.post('/', validateOrderPayload, createOrder);

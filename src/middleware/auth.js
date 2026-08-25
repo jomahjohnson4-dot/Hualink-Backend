@@ -1,5 +1,5 @@
 import jwt from 'jsonwebtoken';
-import prisma from '../utils/prismaClient.js';
+import { prisma } from '../utils/prismaClient.js';
 import logger from '../utils/logger.js';
 
 /**
@@ -28,58 +28,58 @@ export const verifyToken = async (req, res, next) => {
     }
 
     // 2. Verify signature using JWT secret key
-    const secret = process.env.JWT_SECRET || 'your_fallback_jwt_secret_key';
+    const secret = process.env.JWT_SECRET || 'super_secret_jwt_key_hualink_2026_change_in_prod';
     const decoded = jwt.verify(token, secret);
     const userId = decoded.id || decoded.userId;
 
     // 3. Dual Lookup: Check Admin table first, then User table
     let currentUser = null;
-    let userRole = decoded.role || 'user';
 
     // Try finding in Admin table
     try {
       const adminUser = await prisma.admin.findUnique({
         where: { id: userId },
-        select: { id: true, email: true },
+        select: { id: true, email: true, name: true },
       });
+      
       if (adminUser) {
         currentUser = {
           ...adminUser,
-          fullName: 'Admin User',
+          name: adminUser.name || 'Admin User',
+          fullName: adminUser.name || 'Admin User',
           role: 'ADMIN',
           isActive: true,
         };
-        userRole = 'ADMIN';
       }
     } catch (err) {
-      // Prisma admin query failed or table structure differs
+      // Ignore error if Admin table fails or query differs
     }
 
     // If not found in Admin, check User table
     if (!currentUser) {
-      currentUser = await prisma.user.findUnique({
+      const userRecord = await prisma.user.findUnique({
         where: { id: userId },
         select: {
           id: true,
           email: true,
-          fullName: true,
+          name: true,
           role: true,
-          isActive: true,
         },
       });
+
+      if (userRecord) {
+        currentUser = {
+          ...userRecord,
+          fullName: userRecord.name,
+          isActive: true,
+        };
+      }
     }
 
     if (!currentUser) {
       return res.status(401).json({
         success: false,
         message: 'User belonging to this token no longer exists.',
-      });
-    }
-
-    if (currentUser.isActive === false) {
-      return res.status(403).json({
-        success: false,
-        message: 'Your account has been deactivated. Please contact support.',
       });
     }
 
@@ -90,7 +90,7 @@ export const verifyToken = async (req, res, next) => {
     if (logger && logger.error) {
       logger.error(`JWT Verification Error: ${error.message}`);
     } else {
-      console.error(`JWT Verification Error:`, error);
+      console.error(`JWT Verification Error:`, error.message);
     }
 
     if (error.name === 'TokenExpiredError') {
@@ -116,7 +116,7 @@ export const verifyToken = async (req, res, next) => {
 
 /**
  * Role-Based Access Control (RBAC) Middleware
- * Usage: restrictTo('ADMIN', 'MANAGER', 'admin')
+ * Usage: restrictTo('ADMIN', 'MANAGER')
  */
 export const restrictTo = (...roles) => {
   return (req, res, next) => {
@@ -140,6 +140,6 @@ export const restrictTo = (...roles) => {
   };
 };
 
-// Aliases for route flexibility
+// Aliases for route compatibility
 export const authenticateJWT = verifyToken;
 export const requireRole = restrictTo;

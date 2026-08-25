@@ -1,8 +1,60 @@
 import crypto from 'crypto';
+import https from 'https';
+import axios from 'axios';
 import { prisma } from '../utils/prismaClient.js';
 
+// HTTPS Agent configured to prevent connection resets
+const httpsAgent = new https.Agent({
+  keepAlive: true,
+  rejectUnauthorized: true,
+});
+
+// Axios instance configured for AzamPay requirements
+const azamClient = axios.create({
+  httpsAgent,
+  timeout: 15000,
+  headers: {
+    'Content-Type': 'application/json',
+    'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) Hualink/1.0',
+    'Accept': 'application/json',
+  },
+});
+
 /**
- * Initiate payment push (e.g., M-Pesa / Tigo Pesa / Selcom USSD Push)
+ * Fetch AzamPay Bearer Token
+ */
+const getAzamPayToken = async () => {
+  const appName = process.env.AZAMPAY_APP_NAME;
+  const clientId = process.env.AZAMPAY_CLIENT_ID;
+  const clientSecret = process.env.AZAMPAY_CLIENT_SECRET;
+
+  if (!appName || !clientId || !clientSecret) {
+    throw new Error('AzamPay credentials missing in .env (AZAMPAY_APP_NAME, AZAMPAY_CLIENT_ID, AZAMPAY_CLIENT_SECRET)');
+  }
+
+  try {
+    // Corrected URL path with /azampay/ prefix
+    const response = await azamClient.post('https://sandbox.azampay.co.tz/azampay/momo/v1/gettoken', {
+      appName,
+      clientId,
+      clientSecret,
+    });
+
+    const token = response.data?.data?.accessToken || response.data?.accessToken;
+
+    if (!token) {
+      throw new Error(response.data?.message || 'AzamPay auth succeeded but no token returned.');
+    }
+
+    return token;
+  } catch (err) {
+    const apiError = err.response?.data?.message || err.response?.data?.error || err.message;
+    throw new Error(`AzamPay Auth Error: ${apiError}`);
+  }
+};
+
+/**
+ * Initiate payment push (AzamPay Gateway)
  */
 export const initiatePaymentService = async ({ orderId, phone, amount, provider }) => {
   const order = await prisma.order.findUnique({
@@ -17,42 +69,69 @@ export const initiatePaymentService = async ({ orderId, phone, amount, provider 
     throw new Error('Order is already paid');
   }
 
-  // Generate unique transaction reference for mobile gateway tracking
   const transactionRef = `HL-TX-${Date.now()}-${Math.floor(1000 + Math.random() * 9000)}`;
 
-  // Update order with transaction reference
   await prisma.order.update({
     where: { id: orderId },
     data: { transactionRef },
   });
 
-  // Example integration payload structure for Selcom / AzamPay API calls
-  const gatewayPayload = {
-    amount: amount || order.totalAmount,
-    currency: 'TZS',
-    phone: phone || order.customerPhone,
-    reference: transactionRef,
-    orderId: order.id,
-    provider: provider || 'MOBILE_MONEY',
-  };
+  const formattedPhone = (phone || order.customerPhone).replace(/^\+/, '');
+  const paymentAmount = amount || order.totalAmount;
 
-  // Mock gateway trigger response (Replace with real Axios/fetch call to AzamPay or Selcom endpoint)
-  console.log('Initiating Payment Gateway Request:', gatewayPayload);
+  const rawProvider = (provider || '').toUpperCase();
+  let azamOperator = 'Airtel';
 
-  return {
-    success: true,
-    message: 'Payment prompt dispatched to customer mobile device.',
-    transactionRef,
-  };
+  if (rawProvider.includes('MPESA') || rawProvider.includes('M-PESA') || rawProvider.includes('VODACOM')) {
+    azamOperator = 'Mpesa';
+  } else if (rawProvider.includes('TIGO')) {
+    azamOperator = 'Tigo';
+  } else if (rawProvider.includes('HALO')) {
+    azamOperator = 'Halopesa';
+  }
+
+  try {
+    console.log(`[AZAMPAY SANDBOX] Initiating ${azamOperator} push to ${formattedPhone} for ${paymentAmount} TZS`);
+
+    const token = await getAzamPayToken();
+
+    const azamPayload = {
+      accountNumber: formattedPhone,
+      amount: String(paymentAmount),
+      currency: 'TZS',
+      externalId: transactionRef,
+      provider: azamOperator,
+    };
+
+    const response = await azamClient.post(
+      'https://sandbox.azampay.co.tz/azampay/momo/v1/checkout',
+      azamPayload,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      }
+    );
+
+    return {
+      success: true,
+      message: `${azamOperator} payment prompt dispatched successfully.`,
+      transactionRef,
+      data: response.data,
+    };
+
+  } catch (error) {
+    const errorMsg = error.response?.data?.message || error.message || `Failed to dispatch ${azamOperator} payment prompt.`;
+    throw new Error(errorMsg);
+  }
 };
 
 /**
- * Process incoming payment gateway webhooks safely inside a transaction
+ * Process incoming payment gateway webhooks safely
  */
 export const processPaymentWebhookService = async (payload, rawSignature) => {
   const webhookSecret = process.env.WEBHOOK_SECRET;
 
-  // 1. Verify HMAC Signature if secret is configured
   if (webhookSecret && rawSignature) {
     const expectedSignature = crypto
       .createHmac('sha256', webhookSecret)
@@ -64,16 +143,16 @@ export const processPaymentWebhookService = async (payload, rawSignature) => {
     }
   }
 
-  const { orderId, transactionRef, status } = payload;
+  const { orderId, transactionRef, externalId, status } = payload;
+  const refIdentifier = transactionRef || externalId;
 
-  if (!orderId && !transactionRef) {
+  if (!orderId && !refIdentifier) {
     throw new Error('Webhook missing required order identifiers.');
   }
 
-  // Find order by ID or transaction reference
   const order = await prisma.order.findFirst({
     where: {
-      OR: [{ id: orderId || '' }, { transactionRef: transactionRef || '' }],
+      OR: [{ id: orderId || '' }, { transactionRef: refIdentifier || '' }],
     },
   });
 
@@ -81,7 +160,6 @@ export const processPaymentWebhookService = async (payload, rawSignature) => {
     throw new Error('Associated order record not found.');
   }
 
-  // Normalize incoming status from provider
   let updatedPaymentStatus = 'PENDING';
   let updatedOrderStatus = order.status;
 
@@ -92,13 +170,12 @@ export const processPaymentWebhookService = async (payload, rawSignature) => {
     updatedPaymentStatus = 'FAILED';
   }
 
-  // 2. Atomic state transition update
   const updatedOrder = await prisma.order.update({
     where: { id: order.id },
     data: {
       paymentStatus: updatedPaymentStatus,
       status: updatedOrderStatus,
-      ...(transactionRef && { transactionRef }),
+      ...(refIdentifier && { transactionRef: refIdentifier }),
     },
   });
 

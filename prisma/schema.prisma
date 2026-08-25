@@ -24,6 +24,8 @@ enum OrderStatus {
   OUT_FOR_DELIVERY
   DELIVERED
   CANCELLED
+  PAID
+  FAILED
 }
 
 enum PaymentStatus {
@@ -33,58 +35,126 @@ enum PaymentStatus {
   REFUNDED
 }
 
+enum BookingStatus {
+  PENDING
+  APPROVED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
 // ==========================================
 // USER & AUTHENTICATION MODELS
 // ==========================================
 model User {
-  id          String    @id @default(uuid())
-  email       String    @unique
-  password    String
-  name        String
-  phone       String?
-  role        Role      @default(CUSTOMER)
+  id              String           @id @default(uuid())
+  email           String           @unique
+  password        String
+  name            String
+  phone           String?
+  role            Role             @default(CUSTOMER)
 
   // B2B Business & Supplier Fields
-  companyName String?
-  tinNumber   String?
+  companyName     String?          @map("company_name")
+  tinNumber       String?          @map("tin_number")
 
-  orders      Order[]
-  addresses   Address[]
-  products    Product[] // Products supplied/managed by business or supplier
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
+  // Password Reset Fields
+  resetOtp        String?          @map("reset_otp")
+  resetOtpExpires DateTime?        @map("reset_otp_expires")
+
+  orders          Order[]
+  bookings        ServiceBooking[]
+  addresses       Address[]
+  products        Product[]        // Products supplied/managed by business or supplier
+  
+  // Real-Time Chat Relations
+  sentMessages     Message[]        @relation("SentMessages")
+  receivedMessages Message[]        @relation("ReceivedMessages")
+
+  createdAt       DateTime         @default(now()) @map("created_at")
+  updatedAt       DateTime         @updatedAt @map("updated_at")
+
+  @@map("users")
 }
 
 model Address {
   id        String   @id @default(uuid())
-  userId    String
+  userId    String   @map("user_id")
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   region    String   // e.g., 'Dar es Salaam', 'Mbeya'
   district  String?
   street    String
   details   String?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("addresses")
 }
 
 // ==========================================
-// SERVICES MODEL
+// SERVICES & BOOKINGS MODELS
 // ==========================================
 model Service {
-  id          String   @id @default(uuid())
+  id          String           @id @default(uuid())
   title       String
-  category    String   // 'web', 'graphic', 'furniture', 'tech'
+  category    String           // 'web', 'graphic', 'furniture', 'tech'
   provider    String
-  phone       String   // Tanzanian format e.g., 255700000000
+  phone       String           // Tanzanian format e.g., 255700000000
   price       String
   timeline    String
   location    String
   description String
-  tag         String?  @default("Verified Service")
-  status      String   @default("Online Now")
+  tag         String?          @default("Verified Service")
+  status      String           @default("Online Now")
   image       String
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  bookings    ServiceBooking[]
+  createdAt   DateTime         @default(now()) @map("created_at")
+  updatedAt   DateTime         @updatedAt @map("updated_at")
+
+  @@map("services")
+}
+
+model ServiceBooking {
+  id           String        @id @default(uuid())
+  serviceTitle String        @map("service_title")
+  provider     String
+  clientName   String        @map("client_name")
+  clientPhone  String        @map("client_phone")
+  note         String
+  status       BookingStatus @default(PENDING)
+
+  serviceId    String?       @map("service_id")
+  service      Service?      @relation(fields: [serviceId], references: [id], onDelete: SetNull)
+
+  userId       String?       @map("user_id")
+  user         User?         @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  messages     Message[]
+
+  createdAt    DateTime      @default(now()) @map("created_at")
+  updatedAt    DateTime      @updatedAt @map("updated_at")
+
+  @@map("service_bookings")
+}
+
+// ==========================================
+// LIVE IN-APP CHATTING MODEL
+// ==========================================
+model Message {
+  id          String          @id @default(uuid())
+  content     String
+  senderId    String          @map("sender_id")
+  receiverId  String          @map("receiver_id")
+  bookingId   String?         @map("booking_id")
+
+  sender      User            @relation("SentMessages", fields: [senderId], references: [id], onDelete: Cascade)
+  receiver    User            @relation("ReceivedMessages", fields: [receiverId], references: [id], onDelete: Cascade)
+  booking     ServiceBooking? @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+
+  isRead      Boolean         @default(false) @map("is_read")
+  createdAt   DateTime        @default(now()) @map("created_at")
+
+  @@map("messages")
 }
 
 // ==========================================
@@ -97,19 +167,21 @@ model Product {
   category          String
   description       String?
   image             String?
-  basePrice         Float
-  wholesalePrice    Float?      // Tiered wholesale pricing for B2B users
-  minWholesaleQty   Int?        @default(10)
-  stockCount        Int         @default(0)
-  warehouseLocation String?     @default("Main Warehouse")
+  basePrice         Float       @map("base_price")
+  wholesalePrice    Float?      @map("wholesale_price") // Tiered wholesale pricing for B2B users
+  minWholesaleQty   Int?        @default(10) @map("min_wholesale_qty")
+  stockCount        Int         @default(0) @map("stock_count")
+  warehouseLocation String?     @default("Main Warehouse") @map("warehouse_location")
 
-  supplierId        String?
+  supplierId        String?     @map("supplier_id")
   supplier          User?       @relation(fields: [supplierId], references: [id], onDelete: SetNull)
 
   variants          Variant[]
   orderItems        OrderItem[]
-  createdAt         DateTime    @default(now())
-  updatedAt         DateTime    @updatedAt
+  createdAt         DateTime    @default(now()) @map("created_at")
+  updatedAt         DateTime    @updatedAt @map("updated_at")
+
+  @@map("products")
 }
 
 model Variant {
@@ -118,10 +190,12 @@ model Variant {
   color     String?
   storage   String?
   price     Float
-  productId String
+  productId String   @map("product_id")
   product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("variants")
 }
 
 // ==========================================
@@ -129,47 +203,55 @@ model Variant {
 // ==========================================
 model Order {
   id              String        @id @default(uuid())
-  orderNumber     String        @unique
-  customerName    String?
-  customerPhone   String
-  shippingAddress String        @default("Default Address")
+  orderNumber     String        @unique @default(uuid()) @map("order_number")
+  customerName    String?       @map("customer_name")
+  customerPhone   String        @map("customer_phone")
+  shippingAddress String        @default("Default Address") @map("shipping_address")
   region          String        @default("Dar es Salaam")
   subtotal        Float         @default(0.0)
-  shippingFee     Float         @default(0.0)
-  totalAmount     Float
+  shippingFee     Float         @default(0.0) @map("shipping_fee")
+  totalAmount     Float         @map("total_amount")
   status          OrderStatus   @default(PENDING)
-  paymentStatus   PaymentStatus @default(PENDING)
-  paymentMethod   String        @default("MANUAL_MOBILE") // e.g., 'M-PESA', 'AZAM-PAY', 'AIRTEL-MONEY', 'HALOPESA', 'MIXX-BY-YAS'
-  transactionRef  String?
+  paymentStatus   PaymentStatus @default(PENDING) @map("payment_status")
+  paymentMethod   String        @default("MANUAL_MOBILE") @map("payment_method")
+  transactionRef  String?       @map("transaction_ref")
 
-  userId          String?
+  userId          String?       @map("user_id")
   user            User?         @relation(fields: [userId], references: [id], onDelete: SetNull)
 
   items           OrderItem[]
-  createdAt       DateTime      @default(now())
-  updatedAt       DateTime      @updatedAt
+  createdAt       DateTime      @default(now()) @map("created_at")
+  updatedAt       DateTime      @updatedAt @map("updated_at")
+
+  @@map("orders")
 }
 
 model OrderItem {
   id        String   @id @default(uuid())
-  orderId   String
-  productId String
+  orderId   String   @map("order_id")
+  productId String   @map("product_id")
   quantity  Int      @default(1)
-  unitPrice Float
+  unitPrice Float    @map("unit_price")
   order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
   product   Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("order_items")
 }
 
 // ==========================================
 // ADMIN MODEL
 // ==========================================
 model Admin {
-  id        String   @id @default(uuid())
-  email     String   @unique
-  password  String
-  name      String?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id              String    @id @default(uuid())
+  email           String    @unique
+  password        String
+  name            String?
+  resetOtp        String?   @map("reset_otp")
+  resetOtpExpires DateTime? @map("reset_otp_expires")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  @@map("admins")
 }

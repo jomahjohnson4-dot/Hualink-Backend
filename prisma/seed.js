@@ -20,6 +20,7 @@ async function main() {
     update: {},
     create: {
       email: 'admin@hualink.co.tz',
+      name: 'System Admin',
       password: hashedPassword,
     },
   });

@@ -358,8 +358,16 @@ app.use(errorHandler);
 const PORT = process.env.PORT || 5000;
 
 // Start server listening via httpServer (for Socket.io support)
-httpServer.listen(PORT, () => {
+const server = httpServer.listen(PORT, () => {
   logger.info(`🚀 Server & WebSockets running securely on http://localhost:${PORT}`);
+});
+
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    logger.error(`⚠️ Port ${PORT} is busy. Another process is already using this port.`);
+  } else {
+    logger.error(`⚠️ Server error on port ${PORT}:`, err.message);
+  }
 });
 
 // Database Connection Handling

@@ -1,24 +1,26 @@
 import { Router } from 'express';
 import {
-  registerAdmin,
-  loginAdmin,
+  registerUser,
+  loginUser,
+  googleLogin,
   getProfile,
-  requestPasswordReset,
-  verifyResetOtp,
-  resetPassword,
+  requestOtp,
+  verifyResetPassword,
 } from '../controllers/authController.js';
 import { authenticateJWT } from '../middleware/authHandler.js';
 
 const router = Router();
 
-// Admin registration & login
-router.post('/register', registerAdmin);
-router.post('/login', loginAdmin);
+// User registration & login
+router.post('/register', registerUser);
+router.post('/login', loginUser);
 
-// Password reset routes
-router.post('/forgot-password', requestPasswordReset);
-router.post('/verify-otp', verifyResetOtp);
-router.post('/reset-password', resetPassword);
+// Google OAuth login token verification
+router.post('/google', googleLogin);
+
+// Password reset OTP flow
+router.post('/request-otp', requestOtp);
+router.post('/verify-reset-password', verifyResetPassword);
 
 // Protected user profile route
 router.get('/me', authenticateJWT, getProfile);

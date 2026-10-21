@@ -44,6 +44,15 @@ enum BookingStatus {
 }
 
 // ==========================================
+// IN-APP CHAT & INQUIRY LIFECYCLE
+// ==========================================
+enum InquiryStatus {
+  NEW
+  REPLIED
+  RESOLVED
+}
+
+// ==========================================
 // USER & AUTHENTICATION MODELS
 // ==========================================
 model User {
@@ -64,6 +73,12 @@ model User {
   // Password Reset Fields
   resetOtp        String?          @map("reset_otp")
   resetOtpExpires DateTime?        @map("reset_otp_expires")
+
+  // Account Verification — flipped to true once the signup OTP is confirmed
+  emailVerified   Boolean          @default(false) @map("email_verified")
+  verifiedAt      DateTime?        @map("verified_at")
+
+  verificationCodes VerificationCode[]
 
   orders          Order[]
   bookings        ServiceBooking[]
@@ -161,6 +176,118 @@ model Message {
 }
 
 // ==========================================
+// IN-APP CHAT INQUIRIES (LEAD CAPTURE)
+// ==========================================
+model Inquiry {
+  id               String        @id @default(uuid())
+  customerName     String        @map("customer_name")
+  customerContact  String        @map("customer_contact")
+  productOrService String        @map("product_or_service")
+  message          String
+  timestamp        DateTime      @default(now())
+  status           InquiryStatus @default(NEW)
+  repliedAt        DateTime?     @map("replied_at")
+  adminNote        String?       @map("admin_note")
+  createdAt        DateTime      @default(now()) @map("created_at")
+  updatedAt        DateTime      @updatedAt @map("updated_at")
+
+  @@index([status])
+  @@index([createdAt])
+  @@map("inquiries")
+}
+
+// ==========================================
+// SYSTEM-WIDE NOTIFICATIONS (ALERT CENTER)
+// ==========================================
+enum NotificationType {
+  ORDER
+  INQUIRY
+  PRODUCT
+  SYSTEM
+  // A brand new customer completed the sign-up flow.
+  SIGNUP
+  // An OTP / PIN verification event (confirmation or a failed attempt).
+  VERIFY
+}
+
+model Notification {
+  id        String           @id @default(uuid())
+  // The recipient. Every admin shares the 'ADMIN' bucket; customers use their
+  // own user id. Kept as a plain string (not a relation) because admins and
+  // customers live in two separate tables.
+  userId    String           @map("user_id")
+  title     String
+  message   String
+  type      NotificationType @default(SYSTEM)
+  isRead    Boolean          @default(false) @map("is_read")
+  createdAt DateTime         @default(now()) @map("created_at")
+  updatedAt DateTime         @updatedAt @map("updated_at")
+
+  @@index([userId, isRead, createdAt])
+  @@map("notifications")
+}
+
+// ==========================================
+// VERIFICATION CODES (OTP / PIN AUDIT TRAIL)
+// ==========================================
+enum VerificationPurpose {
+  // 6-digit code proving ownership of an email/phone during sign-up.
+  SIGNUP
+  // 4-digit PIN confirming a high-value wholesale order request.
+  ORDER
+}
+
+enum VerificationStatus {
+  PENDING
+  VERIFIED
+  EXPIRED
+  FAILED
+}
+
+model VerificationCode {
+  id         String              @id @default(uuid())
+  code       String
+  purpose    VerificationPurpose @default(SIGNUP)
+  status     VerificationStatus  @default(PENDING)
+
+  // Who the code was issued to. `email` is used before the account exists.
+  email      String?
+  phone      String?
+  userId     String?             @map("user_id")
+  user       User?               @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Set when the code guards a wholesale purchase request.
+  orderId    String?             @map("order_id")
+  amount     Float?
+
+  attempts   Int                 @default(0)
+  expiresAt  DateTime            @map("expires_at")
+  verifiedAt DateTime?           @map("verified_at")
+  createdAt  DateTime            @default(now()) @map("created_at")
+  updatedAt  DateTime            @updatedAt @map("updated_at")
+
+  @@index([email, purpose])
+  @@index([userId, purpose])
+  @@index([status])
+  @@map("verification_codes")
+}
+
+// ==========================================
+// MULTILINGUAL FAQ ENTRIES (EN / SW / ZH / FR)
+// ==========================================
+model Faq {
+  id        String   @id @default(uuid())
+  question  String
+  answers   Json     @default("{}")
+  sortOrder Int      @default(0) @map("sort_order")
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("faqs")
+}
+
+// ==========================================
 // E-COMMERCE PRODUCTS & VARIANTS
 // ==========================================
 model Product {
@@ -171,10 +298,13 @@ model Product {
   description       String?
   image             String?
   basePrice         Float       @map("base_price")
+  originalPrice     Float?      @map("original_price")
+  rating            Float       @default(4.8)
   wholesalePrice    Float?      @map("wholesale_price") // Tiered wholesale pricing for B2B users
   minWholesaleQty   Int?        @default(10) @map("min_wholesale_qty")
   stockCount        Int         @default(0) @map("stock_count")
   warehouseLocation String?     @default("Main Warehouse") @map("warehouse_location")
+  isAvailable       Boolean     @default(true) @map("is_available")
 
   supplierId        String?     @map("supplier_id")
   supplier          User?       @relation(fields: [supplierId], references: [id], onDelete: SetNull)

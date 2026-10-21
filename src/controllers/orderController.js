@@ -2,6 +2,8 @@ import crypto from 'crypto';
 import { prisma } from '../utils/prismaClient.js';
 import { sendSMS } from '../utils/smsService.js';
 import { initiatePaymentService } from '../services/paymentService.js';
+import { broadcastOrderStatus } from '../services/sseService.js';
+import { notifyAdmins, notifyUser } from '../services/notificationService.js';
 
 /**
  * Standard relation include configuration for fetching readable product details inside items.
@@ -369,6 +371,58 @@ export const getOrderById = async (req, res, next) => {
 };
 
 /**
+ * Canonical order lifecycle stages, plus the friendly aliases the admin
+ * dashboard uses ("Dispatched", "In Transit", ...).
+ */
+const ORDER_STATUS_ALIASES = {
+  PENDING: 'PENDING',
+  CONFIRMED: 'CONFIRMED',
+  PROCESSING: 'PROCESSING',
+  DISPATCHED: 'SHIPPED',
+  SHIPPED: 'SHIPPED',
+  'IN TRANSIT': 'OUT_FOR_DELIVERY',
+  'OUT FOR DELIVERY': 'OUT_FOR_DELIVERY',
+  OUT_FOR_DELIVERY: 'OUT_FOR_DELIVERY',
+  DELIVERED: 'DELIVERED',
+  CANCELLED: 'CANCELLED',
+  CANCELED: 'CANCELLED',
+  PAID: 'PAID',
+  FAILED: 'FAILED',
+};
+
+/**
+ * Human readable labels for the lifecycle stages. These are the names the
+ * customer sees in the notification bell and the live route tracking.
+ */
+const ORDER_STATUS_LABELS = {
+  PENDING: 'Pending',
+  CONFIRMED: 'Confirmed',
+  PROCESSING: 'Processing',
+  SHIPPED: 'Dispatched',
+  OUT_FOR_DELIVERY: 'In Transit',
+  DELIVERED: 'Delivered',
+  PAID: 'Delivered',
+  CANCELLED: 'Cancelled',
+  FAILED: 'Cancelled',
+};
+
+/** Resolves a lifecycle stage to its customer-facing label. */
+export const orderStatusLabel = (status) =>
+  ORDER_STATUS_LABELS[String(status || '').toUpperCase()] ||
+  String(status || '').replace(/_/g, ' ');
+
+/**
+ * Resolves a user supplied status label to a valid Prisma enum value.
+ * Returns `null` when the label is unknown.
+ */
+export const resolveOrderStatus = (raw) => {
+  const key = String(raw || '')
+    .trim()
+    .toUpperCase();
+  return ORDER_STATUS_ALIASES[key] || null;
+};
+
+/**
  * Update order status & send SMS update notification
  */
 export const updateOrderStatus = async (req, res, next) => {
@@ -376,12 +430,25 @@ export const updateOrderStatus = async (req, res, next) => {
     const { id } = req.params;
     const { status, paymentStatus } = req.body;
 
+    const resolvedStatus = resolveOrderStatus(status);
+    if (!resolvedStatus) {
+      return res.status(400).json({
+        success: false,
+        message: `Invalid order status. Expected one of: ${Object.keys(ORDER_STATUS_ALIASES).join(', ')}.`,
+      });
+    }
+
+    const existing = await prisma.order.findUnique({ where: { id } });
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Order not found' });
+    }
+
     const updatedOrder = await queryWithFallback(
       () =>
         prisma.order.update({
           where: { id },
           data: {
-            ...(status && { status }),
+            status: resolvedStatus,
             ...(paymentStatus && { paymentStatus }),
           },
           include: orderIncludeWithProducts,
@@ -390,16 +457,40 @@ export const updateOrderStatus = async (req, res, next) => {
         prisma.order.update({
           where: { id },
           data: {
-            ...(status && { status }),
+            status: resolvedStatus,
             ...(paymentStatus && { paymentStatus }),
           },
           include: orderIncludeWithOrderItems,
         })
     );
 
+    // Push the new stage to any client watching live route tracking.
+    broadcastOrderStatus(updatedOrder);
+
+    // Log the status change for the customer and in the admin activity stream.
+    const statusLabel = orderStatusLabel(resolvedStatus);
+    const previousLabel = orderStatusLabel(existing.status);
+    const orderRef = updatedOrder.orderNumber || updatedOrder.id;
+
+    await notifyUser(updatedOrder.userId, {
+      type: 'ORDER',
+      title: `Order ${orderRef} is now ${statusLabel}`,
+      message: `Your order #${orderRef} moved from ${previousLabel} to ${statusLabel}. Track it live from the Orders page.`,
+    }).catch((error) =>
+      console.error('[Notification] Order customer event failed:', error?.message)
+    );
+
+    await notifyAdmins({
+      type: 'ORDER',
+      title: 'Order Status Updated',
+      message: `Order #${orderRef} was moved from ${previousLabel} to ${statusLabel}.`,
+    }).catch((error) =>
+      console.error('[Notification] Order admin event failed:', error?.message)
+    );
+
     // Send Status Update Notification via NextSMS
-    if (status && updatedOrder.customerPhone && updatedOrder.customerPhone !== 'N/A') {
-      const smsMessage = `Habari ${updatedOrder.customerName}, hali ya oda yako #${updatedOrder.orderNumber} imebadilishwa kuwa: ${status}. Ahsante kwa kutumia Hualink!`;
+    if (updatedOrder.customerPhone && updatedOrder.customerPhone !== 'N/A') {
+      const smsMessage = `Habari ${updatedOrder.customerName}, hali ya oda yako #${updatedOrder.orderNumber} imebadilishwa kuwa: ${resolvedStatus}. Ahsante kwa kutumia Hualink!`;
       sendSMS(updatedOrder.customerPhone, smsMessage).catch((err) =>
         console.error('SMS notification error:', err.message)
       );
@@ -410,8 +501,15 @@ export const updateOrderStatus = async (req, res, next) => {
       items: updatedOrder.items || updatedOrder.orderItems || [],
     };
 
-    return res.status(200).json({ success: true, data: normalizedOrder });
+    return res.status(200).json({
+      success: true,
+      message: `Order status updated to ${resolvedStatus}.`,
+      data: normalizedOrder,
+    });
   } catch (error) {
+    if (error?.code === 'P2025') {
+      return res.status(404).json({ success: false, message: 'Order not found' });
+    }
     next(error);
   }
 };

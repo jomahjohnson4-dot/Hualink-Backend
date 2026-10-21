@@ -3,12 +3,27 @@ import jwt from 'jsonwebtoken';
 import { OAuth2Client } from 'google-auth-library';
 import { prisma } from '../utils/prismaClient.js';
 import { sendResetEmail } from '../utils/emailService.js';
+import { notifyAdmins, notifyUser } from '../services/notificationService.js';
+import {
+  requestVerificationCode,
+  verifyVerificationCode,
+  notifyVerificationSuccess,
+  resolvePurpose,
+} from '../services/verificationService.js';
 import logger from '../utils/logger.js';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'fallback_secret_key';
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '1d';
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
+
+/**
+ * Sign-up verification is enforced by default. Set `REQUIRE_OTP_VERIFICATION=false`
+ * to allow unverified registrations (useful for scripted seeding).
+ */
+const isOtpRequired = () =>
+  String(process.env.REQUIRE_OTP_VERIFICATION || 'true').toLowerCase() !== 'false';
+
 
 /**
  * Sign a JWT token for an authenticated user/admin.
@@ -31,20 +46,88 @@ const VALID_ROLES = ['CUSTOMER', 'BUSINESS', 'SUPPLIER', 'ADMIN'];
 /**
  * POST /api/auth/register
  * Creates a user record, hashes the password with bcrypt, returns a JWT token + user object.
+ *
+ * The account is only created once the sign-up verification code has been
+ * confirmed — `verificationId` (the id of an already VERIFIED
+ * `verification_codes` row) or `verificationCode` (the 6-digit code itself)
+ * must be supplied. The verified state is stored in PostgreSQL on both the
+ * `verification_codes` audit row and the `users.email_verified` column.
  */
 export const registerUser = async (req, res, next) => {
   try {
-    const { fullName, email, phone, region, accountType, password, companyName } = req.body;
+    const {
+      fullName,
+      email,
+      phone,
+      region,
+      accountType,
+      password,
+      companyName,
+      verificationId,
+      verificationCode,
+    } = req.body;
 
     if (!email || !password) {
       return res.status(400).json({ success: false, message: 'Email and password are required.' });
     }
 
-    const existingUser = await prisma.user.findUnique({ where: { email } });
+    const normalisedEmail = String(email).trim().toLowerCase();
+
+    const existingUser = await prisma.user.findUnique({ where: { email: normalisedEmail } });
     if (existingUser) {
       return res.status(400).json({ success: false, message: 'A user with this email already exists.' });
     }
 
+    // ---- Verification gate -------------------------------------------------
+    let verification = null;
+
+    if (verificationId) {
+      verification = await prisma.verificationCode.findUnique({ where: { id: verificationId } });
+
+      if (!verification || verification.purpose !== 'SIGNUP') {
+        return res.status(400).json({
+          success: false,
+          message: 'The verification session could not be found. Please verify again.',
+        });
+      }
+
+      if (verification.status !== 'VERIFIED') {
+        return res.status(400).json({
+          success: false,
+          message: 'The verification code has not been confirmed yet.',
+        });
+      }
+
+      if (verification.email && verification.email !== normalisedEmail) {
+        return res.status(400).json({
+          success: false,
+          message: 'The verification code was issued for a different email address.',
+        });
+      }
+    } else if (verificationCode) {
+      try {
+        verification = await verifyVerificationCode({
+          code: verificationCode,
+          email: normalisedEmail,
+          purpose: 'SIGNUP',
+        });
+      } catch (verifyError) {
+        return res.status(verifyError.status || 400).json({
+          success: false,
+          message: verifyError.message || 'Invalid verification code.',
+        });
+      }
+    } else if (isOtpRequired()) {
+      return res.status(400).json({
+        success: false,
+        message: 'A verification code is required to create an account.',
+        requiresVerification: true,
+      });
+    }
+
+    const isVerified = Boolean(verification);
+
+    // ---- Account creation --------------------------------------------------
     const role = accountType && VALID_ROLES.includes(accountType.toUpperCase())
       ? accountType.toUpperCase()
       : 'CUSTOMER';
@@ -54,11 +137,13 @@ export const registerUser = async (req, res, next) => {
     const user = await prisma.user.create({
       data: {
         name: fullName || email,
-        email,
+        email: normalisedEmail,
         phone: phone || null,
         role,
         companyName: companyName || null,
         password: hashedPassword,
+        emailVerified: isVerified,
+        verifiedAt: isVerified ? new Date() : null,
       },
       select: {
         id: true,
@@ -67,6 +152,7 @@ export const registerUser = async (req, res, next) => {
         phone: true,
         role: true,
         companyName: true,
+        emailVerified: true,
         createdAt: true,
       },
     });
@@ -78,16 +164,189 @@ export const registerUser = async (req, res, next) => {
       });
     }
 
+    // Link the verification row to the account it unlocked.
+    if (verification) {
+      await prisma.verificationCode.update({
+        where: { id: verification.id },
+        data: { userId: user.id },
+      });
+    }
+
     const token = signToken(user);
+
+    // ---- Notification trail ------------------------------------------------
+    await notifyAdmins({
+      type: 'SIGNUP',
+      title: 'New User Registration',
+      message: `${user.name} (${user.email}) created a ${
+        role === 'BUSINESS' ? 'Wholesale Partner' : 'Customer'
+      } account${companyName ? ` for ${companyName}` : ''}.`,
+    }).catch((error) =>
+      console.error('[Notification] Sign-up event failed:', error?.message)
+    );
+
+    await notifyUser(user.id, {
+      type: 'SIGNUP',
+      title: 'Welcome to Hualink',
+      message: `Your account is ready. ${
+        isVerified
+          ? 'Your email address has been verified successfully.'
+          : 'Please verify your email address to activate wholesale purchasing.'
+      }`,
+    }).catch((error) =>
+      console.error('[Notification] Welcome event failed:', error?.message)
+    );
 
     res.status(201).json({
       success: true,
-      message: 'Account created successfully.',
+      message: isVerified
+        ? 'Account created and verified successfully.'
+        : 'Account created successfully.',
       token,
       user,
+      verified: isVerified,
     });
   } catch (error) {
     next(error);
+  }
+};
+
+/**
+ * POST /api/auth/request-signup-otp
+ * Issues the 6-digit sign-up verification code and delivers it by email/SMS.
+ *
+ * The code is stored as a PENDING row in `verification_codes` so the sign-up
+ * can be completed by `POST /api/auth/verify-otp`.
+ */
+export const requestSignupOtp = async (req, res, next) => {
+  try {
+    const { email, phone } = req.body || {};
+
+    if (!email && !phone) {
+      return res.status(400).json({
+        success: false,
+        message: 'An email address or phone number is required.',
+      });
+    }
+
+    const normalisedEmail = email ? String(email).trim().toLowerCase() : null;
+
+    if (normalisedEmail) {
+      const existingUser = await prisma.user.findUnique({
+        where: { email: normalisedEmail },
+        select: { id: true },
+      });
+
+      if (existingUser) {
+        return res.status(400).json({
+          success: false,
+          message: 'A user with this email already exists.',
+        });
+      }
+    }
+
+    const result = await requestVerificationCode({
+      email: normalisedEmail,
+      phone,
+      purpose: 'SIGNUP',
+    });
+
+    res.status(200).json({
+      success: true,
+      message: `A ${result.length}-digit verification code has been sent to ${
+        normalisedEmail || phone
+      }.`,
+      data: {
+        verificationId: result.id,
+        purpose: result.purpose,
+        channel: result.channel,
+        expiresAt: result.expiresAt,
+        length: result.length,
+        // Surfaced in demo mode so the UI can offer a one-click autofill.
+        demoCode: result.demoCode,
+        isDemo: result.isDemo,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * POST /api/auth/verify-otp
+ * Processes a verification code request and stores the verified status in
+ * PostgreSQL.
+ *
+ * Handles both verification purposes:
+ *  - `SIGNUP` — a 6-digit code; the `verification_codes` row flips to
+ *    VERIFIED and the linked `users.email_verified` column is stamped.
+ *  - `ORDER` — a 4-digit PIN confirming a wholesale purchase request.
+ */
+export const verifyOtp = async (req, res, next) => {
+  try {
+    const { code, email, phone, purpose, userId, orderId } = req.body || {};
+    const resolvedPurpose = resolvePurpose(purpose, 'SIGNUP');
+
+    if (!code) {
+      return res.status(400).json({
+        success: false,
+        message: 'The verification code is required.',
+      });
+    }
+
+    const verification = await verifyVerificationCode({
+      code,
+      email,
+      phone,
+      purpose: resolvedPurpose,
+      userId: userId || req.user?.id || null,
+    });
+
+    // Attach the account + order to the verified row.
+    if (req.user?.id && verification.userId !== req.user.id) {
+      await prisma.verificationCode.update({
+        where: { id: verification.id },
+        data: { userId: req.user.id, orderId: orderId || verification.orderId },
+      });
+    } else if (orderId && !verification.orderId) {
+      await prisma.verificationCode.update({
+        where: { id: verification.id },
+        data: { orderId },
+      });
+    }
+
+    // Tell the customer their account / order was confirmed.
+    if (resolvedPurpose === 'SIGNUP' && verification.userId) {
+      await notifyVerificationSuccess(verification.userId, {
+        email: verification.email,
+        purpose: 'SIGNUP',
+      }).catch((error) =>
+        console.error('[Notification] Verification event failed:', error?.message)
+      );
+    }
+
+    res.status(200).json({
+      success: true,
+      message:
+        resolvedPurpose === 'ORDER'
+          ? 'Order verification successful.'
+          : 'Verification successful. Your account is verified.',
+      data: {
+        verificationId: verification.id,
+        purpose: verification.purpose,
+        status: verification.status,
+        verifiedAt: verification.verifiedAt,
+        email: verification.email,
+        phone: verification.phone,
+        userId: verification.userId,
+      },
+    });
+  } catch (error) {
+    const status = error.status || 400;
+    res.status(status).json({
+      success: false,
+      message: error.message || 'The verification code could not be confirmed.',
+    });
   }
 };
 
@@ -202,6 +461,9 @@ export const googleLogin = async (req, res, next) => {
           // Google users have no usable password; set a random unusable one
           password: await bcrypt.hash(Math.random().toString(36).slice(-16), 10),
           role: 'CUSTOMER',
+          // Google already proved the customer owns this address.
+          emailVerified: true,
+          verifiedAt: new Date(),
         },
         select: {
           id: true,
@@ -210,6 +472,7 @@ export const googleLogin = async (req, res, next) => {
           phone: true,
           role: true,
           companyName: true,
+          emailVerified: true,
           createdAt: true,
         },
       });
@@ -260,6 +523,8 @@ export const getProfile = async (req, res, next) => {
           phone: true,
           role: true,
           companyName: true,
+          emailVerified: true,
+          verifiedAt: true,
           createdAt: true,
         },
       });

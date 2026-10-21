@@ -20,10 +20,16 @@ import prisma from './src/utils/prismaClient.js';
 import authRoutes from './src/routes/authRoutes.js';
 import productRoutes from './src/routes/productRoutes.js';
 import orderRoutes from './src/routes/orderRoutes.js';
+import adminOrderRoutes from './src/routes/adminOrderRoutes.js';
 import analyticsRoutes from './src/routes/analyticsRoutes.js';
 import serviceRoutes from './src/routes/serviceRoutes.js';
 import paymentRoutes from './src/routes/paymentRoutes.js';
 import inventoryRoutes from './src/routes/inventoryRoutes.js';
+import inquiryRoutes from './src/routes/inquiryRoutes.js';
+import adminInquiryRoutes from './src/routes/adminInquiryRoutes.js';
+import faqRoutes from './src/routes/faqRoutes.js';
+import notificationRoutes from './src/routes/notificationRoutes.js';
+import adminNotificationRoutes from './src/routes/adminNotificationRoutes.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -146,11 +152,17 @@ io.on('connection', (socket) => {
 });
 
 // 4. Global Rate Limiter
+// The admin dashboard, the marketplace and live route tracking all poll the
+// API, so the ceiling has to be comfortably above a normal browsing session.
+// Long-lived SSE streams are excluded — they cost one connection but hold the
+// socket open for the whole journey and would otherwise burn the quota.
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 100,
+  max: 300,
   standardHeaders: true,
   legacyHeaders: false,
+  skip: (req) =>
+    req.path.endsWith('/stream') || req.path.includes('/payments/stream/'),
   message: {
     success: false,
     message: 'Too many requests from this IP. Please try again after 15 minutes.',
@@ -162,6 +174,17 @@ app.use('/api', apiLimiter);
 // 5. Body Parsers, Static Files & Logger
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// `express.json()` leaves `req.body` undefined when a request carries no body
+// at all (a POST without a Content-Type header, for instance). Normalise it
+// so every controller can destructure `req.body` safely.
+app.use((req, _res, next) => {
+  if (!req.body || typeof req.body !== 'object') {
+    req.body = {};
+  }
+  next();
+});
+
 app.use(httpLogger);
 
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
@@ -343,6 +366,22 @@ app.use('/api/analytics', analyticsRoutes);
 app.use('/api/services', serviceRoutes);
 app.use('/api/payments', paymentRoutes);
 app.use('/api/inventory', inventoryRoutes);
+
+// In-app chat & inquiry pipeline
+app.use('/api/inquiries', inquiryRoutes);
+app.use('/api/admin/inquiries', adminInquiryRoutes);
+
+// Multilingual FAQ (EN / SW / ZH / FR)
+app.use('/api/faqs', faqRoutes);
+
+// Admin order feed
+app.use('/api/admin/orders', adminOrderRoutes);
+
+// System-wide notification center (alert bell + admin activity stream)
+app.use('/api/notifications', notificationRoutes);
+
+// Cross-recipient notification & verification audit log (admin only)
+app.use('/api/admin/notifications', adminNotificationRoutes);
 
 // 7. 404 Route Fallback
 app.use('/api', (req, res) => {

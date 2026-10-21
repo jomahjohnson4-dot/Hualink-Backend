@@ -4,6 +4,7 @@ import {
   getProductById,
   createProduct,
   updateProduct,
+  updateProductAvailability,
   deleteProduct,
   getAnalytics,
 } from '../controllers/productController.js';
@@ -21,6 +22,7 @@ router.get('/analytics/overview', authenticateJWT, restrictTo('admin', 'depot'),
 // Protected Admin / Depot Write Actions
 router.post('/', authenticateJWT, restrictTo('admin', 'depot'), createProduct);
 router.put('/:id', authenticateJWT, restrictTo('admin', 'depot'), updateProduct);
+router.patch('/:id/availability', authenticateJWT, restrictTo('admin', 'depot'), updateProductAvailability);
 router.delete('/:id', authenticateJWT, restrictTo('admin', 'depot'), deleteProduct);
 
 export default router;

@@ -41,10 +41,18 @@ export const authenticateJWT = (req, res, next) => {
 
 /**
  * Middleware to restrict access based on user role(s)
+ *
+ * Role comparison is case-insensitive: admin JWTs are signed with the
+ * uppercase Prisma enum value (`ADMIN`) while route guards historically
+ * used lowercase literals (`'admin'`). Normalising both sides keeps a single
+ * spelling from silently locking admins out of their own CRUD endpoints.
  */
 export const restrictTo = (...allowedRoles) => {
   return (req, res, next) => {
-    if (!req.user || !req.user.role || !allowedRoles.includes(req.user.role)) {
+    const userRole = String(req.user?.role || '').toLowerCase();
+    const allowed = allowedRoles.map((role) => String(role).toLowerCase());
+
+    if (!req.user || !userRole || !allowed.includes(userRole)) {
       return res.status(403).json({
         success: false,
         message: 'Access forbidden. Insufficient permissions.'

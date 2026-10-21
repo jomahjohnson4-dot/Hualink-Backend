@@ -4,8 +4,16 @@ import { PrismaPg } from '@prisma/adapter-pg';
 import pg from 'pg';
 import dotenv from 'dotenv';
 import { validateOrderPayload } from '../middleware/orderValidation.js';
-import { verifyToken } from '../middleware/auth.js';
+import { verifyToken, restrictTo } from '../middleware/auth.js';
 import { sendSMS } from '../utils/smsService.js';
+import { registerOrderStatusClient } from '../services/sseService.js';
+import { updateOrderStatus } from '../controllers/orderController.js';
+import {
+  requestOrderPin,
+  verifyOrderPinController,
+  requiresOrderPin,
+} from '../controllers/orderVerificationController.js';
+import { notifyAdmins, notifyUser } from '../services/notificationService.js';
 
 dotenv.config();
 
@@ -113,6 +121,57 @@ export const createOrder = async (req, res) => {
       return res.status(400).json({ message: 'Order total amount must be greater than 0 TZS.' });
     }
 
+    // ---- Purchase request confirmation (PIN) --------------------------------
+    // Wholesale accounts and high-value baskets must be confirmed with the
+    // 4-digit PIN before the order is written to the database. The PIN is
+    // issued by POST /api/orders/request-pin and confirmed by
+    // POST /api/orders/verify-pin, which flips the verification row to
+    // VERIFIED. The client sends the id of that row back with the order.
+    if (requiresOrderPin({ role: req.user?.role, amount: calculatedTotal })) {
+      if (!userId) {
+        return res.status(401).json({
+          success: false,
+          message:
+            'Please sign in to place a wholesale purchase request — a confirmation PIN is required.',
+        });
+      }
+
+      const verificationId = req.body?.verificationId;
+      if (!verificationId) {
+        return res.status(400).json({
+          success: false,
+          message:
+            'A confirmation PIN is required for this purchase request. Please confirm the PIN sent to your contact.',
+          requiresPin: true,
+        });
+      }
+
+      const verification = await prisma.verificationCode.findUnique({
+        where: { id: verificationId },
+      });
+
+      const isValidPin =
+        verification &&
+        verification.purpose === 'ORDER' &&
+        verification.status === 'VERIFIED' &&
+        verification.userId === userId;
+
+      if (!isValidPin) {
+        return res.status(400).json({
+          success: false,
+          message:
+            'The confirmation PIN could not be verified. Please request a new PIN and try again.',
+          requiresPin: true,
+        });
+      }
+
+      // Tie the confirmed PIN to the order it authorised.
+      await prisma.verificationCode.update({
+        where: { id: verificationId },
+        data: { orderId: null, amount: calculatedTotal },
+      });
+    }
+
     const orderNumber = `HL-${Date.now().toString().slice(-6)}`;
     const resolvedProvider = getAzamPayProvider(paymentMethod, customerPhone);
 
@@ -174,6 +233,32 @@ export const createOrder = async (req, res) => {
       const smsMessage = `Habari ${newOrder.customerName}, oda yako #${newOrder.orderNumber} ya TSH ${calculatedTotal.toLocaleString()} imepokelewa. Tafadhali thibitisha malipo kwenye simu yako. Hualink.`;
       sendSMS(customerPhone, smsMessage).catch((err) =>
         console.error('[SMS Dispatch Error]:', err.message || err)
+      );
+    }
+
+    // 4. Log the purchase in the notification centre.
+    //    The admin bucket receives the "new order placed" alert, the customer
+    //    receives the order confirmation. A failure here must never lose the
+    //    order, so both calls are guarded.
+    await notifyAdmins({
+      type: 'ORDER',
+      title: 'New Order Placed',
+      message: `${newOrder.customerName} placed order #${newOrder.orderNumber} for TSh ${calculatedTotal.toLocaleString()} (${items.length} item${
+        items.length === 1 ? '' : 's'
+      }). Payment: ${resolvedProvider}.`,
+    }).catch((error) =>
+      console.error('[Notification] New order event failed:', error?.message)
+    );
+
+    if (validUserId) {
+      await notifyUser(validUserId, {
+        type: 'ORDER',
+        title: `Order #${newOrder.orderNumber} Received`,
+        message: `We have received your purchase of TSh ${calculatedTotal.toLocaleString()}. Complete the ${
+          resolvedProvider
+        } payment prompt on your phone to confirm dispatch.`,
+      }).catch((error) =>
+        console.error('[Notification] Customer order event failed:', error?.message)
       );
     }
 
@@ -273,6 +358,17 @@ export const streamPaymentStatus = (req, res) => {
 };
 
 /**
+ * SSE Endpoint for live route tracking.
+ *
+ * `EventSource` cannot send an Authorization header, so this stream is public
+ * and keyed by the (unguessable) order UUID.
+ */
+export const streamOrderStatus = (req, res) => {
+  const { id } = req.params;
+  registerOrderStatusClient(id, res);
+};
+
+/**
  * Payment gateway callback handler (updates DB & notifies SSE clients)
  */
 export const handlePaymentWebhook = async (req, res) => {
@@ -344,10 +440,20 @@ export const handlePaymentWebhook = async (req, res) => {
 router.post('/payment-webhook', handlePaymentWebhook);
 router.get('/payments/stream/:orderId', streamPaymentStatus);
 
+// Live route tracking stream (public — EventSource cannot send auth headers).
+router.get('/:id/stream', streamOrderStatus);
+
 router.use(verifyToken);
+
+// High-value / wholesale order confirmation (4-digit PIN).
+router.post('/request-pin', requestOrderPin);
+router.post('/verify-pin', verifyOrderPinController);
 
 router.post('/', validateOrderPayload, createOrder);
 router.get('/', getOrders);
 router.get('/:id', getOrderById);
+
+// Admin drives the lifecycle stage; the change is broadcast to live tracking.
+router.patch('/:id/status', restrictTo('ADMIN'), updateOrderStatus);
 
 export default router;

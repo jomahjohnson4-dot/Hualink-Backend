@@ -5,6 +5,7 @@ import {
   googleLogin,
   getProfile,
   requestOtp,
+  forgotPassword,
   verifyResetPassword,
   requestSignupOtp,
   verifyOtp,
@@ -21,6 +22,7 @@ router.post('/login', loginUser);
 router.post('/google', googleLogin);
 
 // Password reset OTP flow
+router.post('/forgot-password', forgotPassword);
 router.post('/request-otp', requestOtp);
 router.post('/verify-reset-password', verifyResetPassword);
 

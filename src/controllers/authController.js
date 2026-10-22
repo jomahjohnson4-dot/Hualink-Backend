@@ -1,8 +1,9 @@
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import { randomInt } from 'node:crypto';
 import { OAuth2Client } from 'google-auth-library';
 import { prisma } from '../utils/prismaClient.js';
-import { sendResetEmail } from '../utils/emailService.js';
+import { sendPasswordResetEmail } from '../services/emailService.js';
 import { notifyAdmins, notifyUser } from '../services/notificationService.js';
 import {
   requestVerificationCode,
@@ -37,9 +38,12 @@ const signToken = (payload) => {
 };
 
 /**
- * Generate a secure 6-digit numeric OTP code.
+ * Generate a secure 6-digit numeric passcode.
+ *
+ * `crypto.randomInt` is used instead of `Math.random()`: the passcode is the
+ * only secret protecting a password reset, so it has to be unpredictable.
  */
-const generateOtp = () => Math.floor(100000 + Math.random() * 900000).toString();
+const generateOtp = () => randomInt(100000, 1000000).toString();
 
 const VALID_ROLES = ['CUSTOMER', 'BUSINESS', 'SUPPLIER', 'ADMIN'];
 
@@ -262,6 +266,8 @@ export const requestSignupOtp = async (req, res, next) => {
         channel: result.channel,
         expiresAt: result.expiresAt,
         length: result.length,
+        // Whether the code actually reached the customer by email.
+        delivered: result.delivered,
         // Surfaced in demo mode so the UI can offer a one-click autofill.
         demoCode: result.demoCode,
         isDemo: result.isDemo,
@@ -541,8 +547,112 @@ export const getProfile = async (req, res, next) => {
 };
 
 /**
+ * Issues a password reset passcode for a user and emails it.
+ *
+ * Every call mints a brand new, randomly generated 6-digit passcode and
+ * mails it to the account owner through Nodemailer — there is no fixed or
+ * demo value involved, in development as much as in production. The passcode
+ * is persisted on the account (`resetOtp` / `resetOtpExpires`) and lives for
+ * 10 minutes; issuing a new one overwrites the previous passcode, so a
+ * "Resend passcode" click invalidates the code the customer had before.
+ *
+ * Delivery failures never abort the flow: the passcode stays valid so the
+ * customer can still complete the reset once the mail provider recovers.
+ *
+ * @param {object} user the account the passcode belongs to
+ * @returns {Promise<{passcode: string, expiresAt: Date, delivery: object}>}
+ */
+const issuePasswordPasscode = async (user) => {
+  const passcode = generateOtp();
+  // 10-minute expiry per specification
+  const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+
+  await prisma.user.update({
+    where: { id: user.id },
+    data: { resetOtp: passcode, resetOtpExpires: expiresAt },
+  });
+
+  // Deliver the passcode via SMTP (Nodemailer).
+  const delivery = await sendPasswordResetEmail(user.email, passcode);
+
+  if (delivery?.delivered) {
+    logger.info(`📧 Password reset passcode sent to ${user.email}`);
+  } else {
+    logger.warn(
+      `⚠️  Password reset passcode could not be emailed to ${user.email}: ${
+        delivery?.error || 'unknown error'
+      }. DEV PASSCODE (check server logs): ${passcode}`
+    );
+  }
+
+  return { passcode, expiresAt, delivery };
+};
+
+/**
+ * POST /api/auth/forgot-password
+ * Generates a random 6-digit password reset passcode and emails it to the
+ * account owner.
+ *
+ * Every submission mails a fresh passcode — submitting the form again (or
+ * clicking "Resend passcode") issues a new one and invalidates the previous.
+ *
+ * The response is identical whether or not the address is registered, so the
+ * endpoint cannot be used to enumerate customer accounts.
+ */
+export const forgotPassword = async (req, res, next) => {
+  try {
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ success: false, message: 'Email is required.' });
+    }
+
+    const normalisedEmail = String(email).trim().toLowerCase();
+
+    const user = await prisma.user.findUnique({
+      where: { email: normalisedEmail },
+      select: { id: true, email: true, name: true },
+    });
+
+    const response = {
+      success: true,
+      message:
+        'If an account exists for that email address, a password reset passcode has been sent.',
+    };
+
+    if (!user) {
+      logger.warn(
+        `🔐 Password reset requested for an unregistered address: ${normalisedEmail}`
+      );
+      return res.status(200).json(response);
+    }
+
+    const { expiresAt, delivery } = await issuePasswordPasscode(user);
+
+    res.status(200).json({
+      ...response,
+      data: {
+        email: user.email,
+        channel: ['email'],
+        expiresAt,
+        // False when SMTP could not reach the mailbox (the passcode stays
+        // valid and the request still succeeds).
+        delivered: Boolean(delivery?.delivered),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
  * POST /api/auth/request-otp
- * Generates a 6-digit OTP with a 10-minute expiry and delivers it by email.
+ * Generates a random 6-digit passcode with a 10-minute expiry and delivers it
+ * by email.
+ *
+ * This is the endpoint behind the "Resend passcode" button: every request
+ * mints a new passcode, emails it through Nodemailer and replaces the one the
+ * customer received before.
  */
 export const requestOtp = async (req, res, next) => {
   try {
@@ -552,35 +662,23 @@ export const requestOtp = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Email is required.' });
     }
 
-    const user = await prisma.user.findUnique({ where: { email } });
+    const normalisedEmail = String(email).trim().toLowerCase();
+
+    const user = await prisma.user.findUnique({
+      where: { email: normalisedEmail },
+      select: { id: true, email: true },
+    });
+
     if (!user) {
       return res.status(404).json({ success: false, message: 'No account associated with this email.' });
     }
 
-    const otp = generateOtp();
-    // 10-minute expiry per specification
-    const otpExpiry = new Date(Date.now() + 10 * 60 * 1000);
-
-    await prisma.user.update({
-      where: { email },
-      data: { resetOtp: otp, resetOtpExpires: otpExpiry },
-    });
-
-    // Deliver the OTP via SMTP/Resend (Nodemailer)
-    try {
-      await sendResetEmail(email, otp);
-      logger.info(`📧 Password reset OTP sent to ${email}`);
-    } catch (emailError) {
-      // SMTP may not be configured in local/dev environments. Log the OTP so the
-      // reset flow can still be tested without breaking the request.
-      logger.warn(
-        `⚠️  Email delivery failed for ${email}. DEV OTP (check server logs): ${otp}. Error: ${emailError.message}`
-      );
-    }
+    const { delivery } = await issuePasswordPasscode(user);
 
     res.status(200).json({
       success: true,
       message: 'A 6-digit verification code has been sent to your email address.',
+      data: { delivered: Boolean(delivery?.delivered) },
     });
   } catch (error) {
     next(error);
@@ -603,7 +701,11 @@ export const verifyResetPassword = async (req, res, next) => {
       });
     }
 
-    const user = await prisma.user.findUnique({ where: { email } });
+    // Accounts are stored with a lower-cased address, so the lookup has to use
+    // the same normalisation or a valid passcode would be rejected.
+    const normalisedEmail = String(email).trim().toLowerCase();
+
+    const user = await prisma.user.findUnique({ where: { email: normalisedEmail } });
     if (!user || user.resetOtp !== code) {
       return res.status(400).json({ success: false, message: 'Invalid verification code.' });
     }
@@ -616,7 +718,7 @@ export const verifyResetPassword = async (req, res, next) => {
 
     // Update password & clear the reset OTP / expiry fields
     await prisma.user.update({
-      where: { email },
+      where: { email: normalisedEmail },
       data: {
         password: hashedPassword,
         resetOtp: null,

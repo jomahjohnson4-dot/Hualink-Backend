@@ -15,6 +15,7 @@ import httpLogger from './src/middleware/httpLogger.js';
 import errorHandler from './src/middleware/errorHandler.js';
 import logger from './src/utils/logger.js';
 import prisma from './src/utils/prismaClient.js';
+import { smtpConfig, verifySmtpConnection } from './src/services/emailService.js';
 
 // Import Existing Routes
 import authRoutes from './src/routes/authRoutes.js';
@@ -414,6 +415,21 @@ prisma
   .$connect()
   .then(() => logger.info('✅ PostgreSQL Database connected cleanly'))
   .catch((err) => logger.error('❌ Database connection failed:', err));
+
+// Mail Transport Sanity Check (non-fatal)
+// The API boots with or without a working mail provider — OTPs and PINs are
+// simply logged to the terminal when SMTP is unreachable.
+const smtp = smtpConfig();
+if (!smtp.auth.user) {
+  logger.warn(
+    '⚠️ SMTP_USER is not set — verification codes will only be logged to the terminal.'
+  );
+} else {
+  logger.info(`📧 Mail transport configured: ${smtp.host}:${smtp.port} (from ${smtp.from})`);
+  verifySmtpConnection().catch(() => {
+    // verifySmtpConnection already logs the reason.
+  });
+}
 
 // Unhandled Errors / Signals
 process.on('unhandledRejection', (reason) => {

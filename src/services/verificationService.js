@@ -1,7 +1,8 @@
 // src/services/verificationService.js
+import { randomInt } from 'node:crypto';
 import prisma from '../utils/prismaClient.js';
 import logger from '../utils/logger.js';
-import { sendVerificationEmail } from '../utils/emailService.js';
+import { sendVerificationEmail } from './emailService.js';
 import { sendSMS } from '../utils/smsService.js';
 import { notifyAdmins, notifyUser } from './notificationService.js';
 
@@ -38,18 +39,31 @@ export const VERIFICATION_PURPOSES = ['SIGNUP', 'ORDER'];
 /**
  * Demo mode keeps the flows testable without a live SMTP/SMS provider.
  *
- * When it is on, the generated code is the well-known demo value, the demo
- * value is always accepted by the verifier, and the code is echoed back to the
- * client so the UI can offer a one-click autofill helper.
+ * It is strictly opt-in: only `ALLOW_DEMO_OTP=true` switches it on. Running
+ * the server with `NODE_ENV=development` no longer pins the codes — every
+ * request issues a fresh, randomly generated code that is emailed for real.
+ *
+ * When demo mode is on, the code is echoed back to the client so the UI can
+ * offer a one-click autofill helper.
  */
 export const isDemoMode = () =>
-  String(process.env.ALLOW_DEMO_OTP || '').toLowerCase() === 'true' ||
-  process.env.NODE_ENV !== 'production';
+  String(process.env.ALLOW_DEMO_OTP || '').trim().toLowerCase() === 'true';
 
-/** The demo codes surfaced by the UI helper. */
+/**
+ * The demo codes surfaced by the UI helper.
+ *
+ * They only exist when an operator configured them explicitly (for example
+ * `DEMO_OTP_CODE=123456`); the platform never falls back to a well-known
+ * value on its own. The getters read the environment on every access so a
+ * changed variable takes effect without a restart of the module.
+ */
 export const DEMO_CODES = {
-  SIGNUP: process.env.DEMO_OTP_CODE || '123456',
-  ORDER: process.env.DEMO_PIN_CODE || '1234',
+  get SIGNUP() {
+    return process.env.DEMO_OTP_CODE || null;
+  },
+  get ORDER() {
+    return process.env.DEMO_PIN_CODE || null;
+  },
 };
 
 /** Normalises a raw purpose into a valid enum value. */
@@ -59,18 +73,32 @@ export const resolvePurpose = (raw, fallback = 'SIGNUP') => {
   return fallback;
 };
 
-/** Generates a numeric code of the requested length. */
+/**
+ * Generates a cryptographically random numeric code of the requested length.
+ *
+ * `crypto.randomInt` is used instead of `Math.random()` because these codes
+ * are the only thing standing between a mailbox and a customer account.
+ */
 const generateNumericCode = (length) => {
-  const digits = [];
+  let code = '';
   for (let i = 0; i < length; i += 1) {
-    digits.push(Math.floor(Math.random() * 10));
+    code += randomInt(0, 10).toString();
   }
-  return digits.join('');
+  return code;
 };
 
-/** Builds the code an account sign-up / order confirmation should use. */
-const buildCode = (purpose) =>
-  isDemoMode() ? DEMO_CODES[purpose] : generateNumericCode(CODE_LENGTH[purpose]);
+/**
+ * Builds the code an account sign-up / order confirmation should use.
+ *
+ * A pinned demo code is only used when demo mode is switched on *and* an
+ * operator configured one for that purpose. In every other case a fresh
+ * random code is issued and mailed to the customer.
+ */
+const buildCode = (purpose) => {
+  const demoCode = DEMO_CODES[purpose];
+  if (isDemoMode() && demoCode) return demoCode;
+  return generateNumericCode(CODE_LENGTH[purpose]);
+};
 
 /** The human readable label used in notifications and emails. */
 const purposeLabel = (purpose) =>
@@ -139,12 +167,18 @@ export const requestVerificationCode = async ({
   // Deliver the code. Delivery failures are never fatal — the code stays
   // persisted so the flow can still be completed (and inspected in dev mode).
   const channel = [];
+  const delivered = {};
 
   if (emailValue) {
     channel.push('email');
     try {
-      await sendVerificationEmail(emailValue, code, resolvedPurpose);
+      const result = await sendVerificationEmail(emailValue, code, resolvedPurpose, {
+        amount,
+        orderId,
+      });
+      delivered.email = result?.delivered ?? null;
     } catch (emailError) {
+      delivered.email = false;
       logger.warn(
         `⚠️  Verification email failed for ${emailValue}: ${emailError.message}`
       );
@@ -160,7 +194,9 @@ export const requestVerificationCode = async ({
           TTL_MINUTES[resolvedPurpose]
         } minutes.`
       );
+      delivered.sms = true;
     } catch (smsError) {
+      delivered.sms = false;
       logger.warn(
         `⚠️  Verification SMS failed for ${phoneValue}: ${smsError.message}`
       );
@@ -195,6 +231,9 @@ export const requestVerificationCode = async ({
     channel,
     expiresAt,
     length: CODE_LENGTH[resolvedPurpose],
+    // Per-channel delivery report so the API can tell the client whether the
+    // code actually reached the customer.
+    delivered,
     // Only surfaced in demo mode so the UI can offer an autofill helper.
     demoCode: isDemoMode() ? code : null,
     isDemo: isDemoMode(),
@@ -267,8 +306,11 @@ export const verifyVerificationCode = async ({
     });
   }
 
-  const demoAccepted =
-    isDemoMode() && submitted === DEMO_CODES[resolvedPurpose];
+  // The pinned demo code is only accepted when demo mode is switched on
+  // explicitly *and* an operator configured one for this purpose. Without
+  // that, only the code that was actually issued is ever accepted.
+  const demoCode = DEMO_CODES[resolvedPurpose];
+  const demoAccepted = isDemoMode() && Boolean(demoCode) && submitted === demoCode;
 
   if (record.code !== submitted && !demoAccepted) {
     // Count the failed attempt so brute forcing leaves a trail.

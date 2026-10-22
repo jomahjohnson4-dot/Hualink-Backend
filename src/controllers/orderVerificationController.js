@@ -4,7 +4,9 @@ import {
   requestVerificationCode,
   verifyOrderPin,
 } from '../services/verificationService.js';
+import { sendHighValueOrderAlert } from '../services/emailService.js';
 import { notifyAdmins } from '../services/notificationService.js';
+import logger from '../utils/logger.js';
 
 /**
  * Orders above this value (TZS) always require a PIN confirmation before the
@@ -62,6 +64,39 @@ export const requestOrderPin = async (req, res, next) => {
       amount,
     });
 
+    // High-value purchases also raise an alert in the operations mailbox so
+    // the team knows a large order is waiting for its PIN confirmation.
+    // A delivery problem here must never break the PIN request.
+    if (Number(amount || 0) >= HIGH_VALUE_THRESHOLD) {
+      // The PIN itself is only echoed back to the customer in demo mode, so
+      // the alert reads it from the stored verification row.
+      prisma.verificationCode
+        .findUnique({
+          where: { id: result.id },
+          select: { code: true },
+        })
+        .then((record) =>
+          sendHighValueOrderAlert({
+            email: user.email,
+            name: user.name,
+            amount,
+            code: record?.code,
+          })
+        )
+        .then((delivery) => {
+          if (!delivery?.delivered) {
+            logger.warn(
+              `⚠️  High-value order alert could not be emailed for ${user.email}: ${delivery?.error || 'unknown error'}`
+            );
+          }
+        })
+        .catch((error) =>
+          logger.warn(
+            `⚠️  High-value order alert failed for ${user.email}: ${error?.message}`
+          )
+        );
+    }
+
     res.status(200).json({
       success: true,
       message: `A ${result.length}-digit confirmation PIN has been sent to ${
@@ -73,6 +108,8 @@ export const requestOrderPin = async (req, res, next) => {
         channel: result.channel,
         expiresAt: result.expiresAt,
         length: result.length,
+        // Whether the PIN actually reached the customer by email.
+        delivered: result.delivered,
         // Surfaced in demo mode so the UI can offer a one-click autofill.
         demoCode: result.demoCode,
         isDemo: result.isDemo,
